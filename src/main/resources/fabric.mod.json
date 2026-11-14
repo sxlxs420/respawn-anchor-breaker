@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "respawn_anchor_breaker",
+  "version": "${version}",
+  "name": "Respawn Anchor Breaker",
+  "description": "Client-side: smoothly looks at and breaks nearby respawn anchors, one after another.",
+  "authors": ["You"],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["com.respawnanchorbreaker.RespawnAnchorBreakerClient"]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.0",
+    "minecraft": "~26.3",
+    "java": ">=25",
+    "fabric-api": "*"
+  }
+}

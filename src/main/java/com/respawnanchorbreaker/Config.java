@@ -23,6 +23,14 @@ public final class Config {
     public int radius = 10;
     /** How often (in ticks) to scan for anchors while no target is selected (1-100). */
     public int scanIntervalTicks = 10;
+    /** Switch to the pickaxe hotbar slot before breaking an anchor. */
+    public boolean autoSwap = true;
+    /** Hotbar slot (1-9) holding the pickaxe. */
+    public int pickaxeSlot = 3;
+    /** Walk to dropped respawn anchor items and pick them up. */
+    public boolean autoPickup = true;
+    /** Largest drop (in blocks) it will walk off while going for a dropped anchor (1-64). */
+    public int maxDropBlocks = 20;
 
     public static Config get() {
         return instance;
@@ -60,5 +68,7 @@ public final class Config {
     private void sanitize() {
         radius = Math.max(1, Math.min(32, radius));
         scanIntervalTicks = Math.max(1, Math.min(100, scanIntervalTicks));
+        pickaxeSlot = Math.max(1, Math.min(9, pickaxeSlot));
+        maxDropBlocks = Math.max(1, Math.min(64, maxDropBlocks));
     }
 }

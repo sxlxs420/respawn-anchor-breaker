@@ -2,6 +2,7 @@ package com.respawnanchorbreaker;
 
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
@@ -47,6 +48,17 @@ public final class AnchorController {
     private boolean wantAttack;
     private boolean holdingAttack;
 
+    // eating / baritone state
+    private int eatPending;
+    private int eatDelay;
+    private int eatTicks;
+    private int eatPause;
+    private boolean eating;
+    private boolean useSeen;
+    private boolean eatKeysDown;
+    private int minedSinceGoto;
+    private int lastBreakTick = -1000;
+
     // pickup state
     private ItemEntity pickup;
     private int itemScanClock = 1000;
@@ -64,6 +76,7 @@ public final class AnchorController {
         if (!active(mc)) {
             releaseAttack(mc);
             stopWalking(mc);
+            stopEating(mc);
             return;
         }
         if (target == null) {
@@ -99,16 +112,18 @@ public final class AnchorController {
         ClientLevel level = mc.level;
         ignoredUntil.values().removeIf(exp -> exp <= clock);
         ignoredItems.values().removeIf(exp -> exp <= clock);
+        if (eatDelay > 0) eatDelay--;
 
         // ---- dropped anchor pickup (takes over only when we are not mid-break)
         if (pickup != null && !pickupStillValid(player, cfg)) {
             endPickup(mc);
         }
-        if (pickup == null && cfg.autoPickup && !wantAttack && ++itemScanClock >= 5) {
+        if (pickup == null && cfg.autoPickup && !wantAttack && !eating && ++itemScanClock >= 5) {
             itemScanClock = 0;
             ItemEntity found = findDroppedAnchor(level, player, cfg.radius);
             if (found != null) {
                 clearTarget(mc);
+                stopEating(mc);
                 pickup = found;
                 pickupTicks = 0;
                 waitTicks = 0;
@@ -123,8 +138,18 @@ public final class AnchorController {
         }
         stopWalking(mc);
 
+        // ---- eating after each anchor (only when not mid-break)
+        if (cfg.autoEat && eatPending > 0 && eatDelay == 0 && !wantAttack) {
+            if (tickEating(mc, player, level, cfg)) return;
+        } else if (eating || eatKeysDown) {
+            stopEating(mc);
+        }
+
         // ---- anchor breaking
         if (target != null && !stillValid(player, level)) {
+            if (ticksOnTarget > 0 && !level.getBlockState(target).is(Blocks.RESPAWN_ANCHOR)) {
+                onAnchorBroken(cfg);
+            }
             clearTarget(mc);
         }
 
@@ -132,6 +157,7 @@ public final class AnchorController {
             if (++ticksSinceScan >= cfg.scanIntervalTicks) {
                 ticksSinceScan = 0;
                 acquire(player, level, cfg.radius);
+                if (target == null) maybeSendGoto(mc, cfg);
             }
             if (target == null) {
                 wantAttack = false;
@@ -159,7 +185,7 @@ public final class AnchorController {
 
         double reach = player.blockInteractionRange();
         boolean near = eye.distanceTo(aimPoint) <= reach + 1.0;
-        boolean slotReady = !near || ensurePickaxeSlot(player, cfg);
+        boolean slotReady = !near || !cfg.autoSwap || ensureSlot(player, cfg.pickaxeSlot);
         boolean aimed = hitsTarget(mc);
         wantAttack = aimed && slotReady;
 
@@ -325,11 +351,93 @@ public final class AnchorController {
                 || st.is(Blocks.CACTUS);
     }
 
+
+    // ---------------------------------------------------------------- eating / baritone
+
+    private void onAnchorBroken(Config cfg) {
+        minedSinceGoto++;
+        lastBreakTick = clock;
+        if (cfg.autoEat) {
+            eatPending = cfg.eatCount;
+            eatDelay = 12; // give the drop time to appear and be picked up first
+        }
+    }
+
+    /** Eats one piece at a time from the food slot. Returns true while eating owns this tick. */
+    private boolean tickEating(Minecraft mc, LocalPlayer player, ClientLevel level, Config cfg) {
+        if (eatPause > 0) {
+            eatPause--;
+            return true;
+        }
+        if (!eating) {
+            if (!player.canEat(false)) { // already full: nothing to try
+                eatPending = 0;
+                return false;
+            }
+            clearTarget(mc);
+            eating = true;
+            eatTicks = 0;
+            useSeen = false;
+        }
+        if (!ensureSlot(player, cfg.foodSlot)) return true;
+
+        // Sneaking makes right-click use the item instead of interacting with the block under the crosshair.
+        mc.options.keyShift.setDown(true);
+        eatKeysDown = true;
+
+        // Never right-click while pointing at a respawn anchor (outside the Nether it can explode).
+        if (mc.hitResult instanceof BlockHitResult b && b.getType() == HitResult.Type.BLOCK
+                && level.getBlockState(b.getBlockPos()).is(Blocks.RESPAWN_ANCHOR)) {
+            mc.options.keyUse.setDown(false);
+            rotateTo(player, player.getYRot(), 75.0F);
+            return true;
+        }
+
+        mc.options.keyUse.setDown(true);
+        eatTicks++;
+        if (player.isUsingItem()) {
+            useSeen = true;
+        } else if (useSeen) { // bite finished
+            stopEating(mc);
+            eatPending--;
+            eatPause = 6;
+            return true;
+        }
+        if ((!useSeen && eatTicks > 12) || eatTicks > 120) { // not edible / can't eat / stuck
+            eatPending = 0;
+            stopEating(mc);
+            return false;
+        }
+        return true;
+    }
+
+    private void stopEating(Minecraft mc) {
+        if (eatKeysDown) {
+            mc.options.keyUse.setDown(false);
+            mc.options.keyShift.setDown(false);
+            eatKeysDown = false;
+        }
+        eating = false;
+        useSeen = false;
+        eatTicks = 0;
+    }
+
+    /** Once everything nearby is mined, picked up and eaten, tell Baritone to go to the next anchor. */
+    private void maybeSendGoto(Minecraft mc, Config cfg) {
+        if (!cfg.baritoneGoto || minedSinceGoto <= 0) return;
+        if (pickup != null || eatPending > 0 || eating) return;
+        if (clock - lastBreakTick < 40) return;
+        ClientPacketListener conn = mc.getConnection();
+        if (conn == null) return;
+        conn.sendChat(cfg.gotoCommand);
+        minedSinceGoto = 0;
+    }
+
     // ---------------------------------------------------------------- helpers
 
-    private boolean ensurePickaxeSlot(LocalPlayer p, Config cfg) {
-        if (!cfg.autoSwap) return true;
-        int want = Mth.clamp(cfg.pickaxeSlot, 1, 9) - 1;
+    /** Selects the given hotbar slot (1-9) after a short human-like delay. True once it is selected. */
+    private boolean ensureSlot(LocalPlayer p, int slot1Based) {
+        int want = Mth.clamp(slot1Based, 1, 9) - 1;
         Inventory inv = p.getInventory();
         if (inv.getSelectedSlot() == want) {
             swapDelay = -1;
@@ -349,12 +457,13 @@ public final class AnchorController {
                 && mc.gui.screen() == null
                 && !mc.player.isSpectator()
                 && !mc.player.isPassenger()
-                && !mc.player.isUsingItem();
+                && (eating || !mc.player.isUsingItem());
     }
 
     private void reset(Minecraft mc) {
         releaseAttack(mc);
         stopWalking(mc);
+        stopEating(mc);
         target = null;
         aimPoint = null;
         pickup = null;

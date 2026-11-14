@@ -1,3 +1,4 @@
 {
-  "key.respawn_anchor_breaker.toggle": "Toggle Respawn Anchor Breaker"
+  "key.respawn_anchor_breaker.toggle": "Toggle Respawn Anchor Breaker",
+  "key.respawn_anchor_breaker.gui": "Open Respawn Anchor Breaker menu"
 }

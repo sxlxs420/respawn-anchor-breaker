@@ -8,6 +8,7 @@ import net.minecraft.client.KeyMapping;
 
 public class RespawnAnchorBreakerClient implements ClientModInitializer {
     public static KeyMapping toggleKey;
+    public static KeyMapping guiKey;
 
     @Override
     public void onInitializeClient() {
@@ -17,6 +18,19 @@ public class RespawnAnchorBreakerClient implements ClientModInitializer {
                 InputConstants.Type.KEYBOARD,
                 InputConstants.KEY_R,
                 KeyMapping.Category.MISC));
+
+        guiKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
+                "key.respawn_anchor_breaker.gui",
+                InputConstants.Type.KEYBOARD,
+                InputConstants.KEY_RCONTROL,
+                KeyMapping.Category.MISC));
+        ClientTickEvents.END_CLIENT_TICK.register(mc -> {
+            while (guiKey.consumeClick()) {
+                if (mc.player != null && mc.gui.screen() == null) {
+                    mc.gui.setScreen(new ClickGuiScreen());
+                }
+            }
+        });
 
         AnchorController controller = new AnchorController();
         ClientTickEvents.START_CLIENT_TICK.register(controller::startTick);

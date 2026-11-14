@@ -31,6 +31,16 @@ public final class Config {
     public boolean autoPickup = true;
     /** Largest drop (in blocks) it will walk off while going for a dropped anchor (1-64). */
     public int maxDropBlocks = 20;
+    /** After each broken anchor, eat food from foodSlot. */
+    public boolean autoEat = true;
+    /** Hotbar slot (1-9) holding food. */
+    public int foodSlot = 4;
+    /** How many pieces to try to eat after each anchor (1-10). Skips if already full. */
+    public int eatCount = 2;
+    /** When no anchors are left nearby, type gotoCommand in chat (for Baritone). */
+    public boolean baritoneGoto = true;
+    /** Sent as a chat message. Without Baritone installed this would appear in server chat! */
+    public String gotoCommand = "#goto minecraft:respawn_anchor";
 
     public static Config get() {
         return instance;
@@ -70,5 +80,8 @@ public final class Config {
         scanIntervalTicks = Math.max(1, Math.min(100, scanIntervalTicks));
         pickaxeSlot = Math.max(1, Math.min(9, pickaxeSlot));
         maxDropBlocks = Math.max(1, Math.min(64, maxDropBlocks));
+        foodSlot = Math.max(1, Math.min(9, foodSlot));
+        eatCount = Math.max(1, Math.min(10, eatCount));
+        if (gotoCommand == null || gotoCommand.isBlank()) gotoCommand = "#goto minecraft:respawn_anchor";
     }
 }

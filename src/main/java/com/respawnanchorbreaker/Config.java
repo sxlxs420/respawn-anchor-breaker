@@ -20,7 +20,7 @@ public final class Config {
     /** Master on/off switch (also toggled by the keybind). */
     public boolean enabled = true;
     /** Detection radius in blocks (1-32). */
-    public int radius = 10;
+    public int radius = 4;
     /** How often (in ticks) to scan for anchors while no target is selected (1-100). */
     public int scanIntervalTicks = 10;
     /** Switch to the pickaxe hotbar slot before breaking an anchor. */

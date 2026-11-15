@@ -49,6 +49,18 @@ public final class Config {
     public boolean baritoneGoto = true;
     /** Sent as a chat message. Without Baritone installed this would appear in server chat! */
     public String gotoCommand = "#goto minecraft:respawn_anchor";
+    /** Sent when you get low on health or pop a totem, to stop Baritone. */
+    public String baritoneCancelCommand = "#cancel";
+    /** Below lowHealthHp: cancel Baritone, eat until full, wait for full health, then resume. */
+    public boolean healthGuard = true;
+    /** Health points (2 per heart) that count as low. 5 = 2.5 hearts. */
+    public int lowHealthHp = 5;
+    /** After a totem pop: open the inventory until AutoTotem refills the offhand, then close it. */
+    public boolean totemGuard = true;
+    /** Show the small draggable credit card on screen. */
+    public boolean showOverlay = true;
+    public int overlayX = 6;
+    public int overlayY = 6;
 
     public static Config get() {
         return instance;
@@ -85,6 +97,8 @@ public final class Config {
 
     private void sanitize() {
         reachMargin = Math.max(0.0, Math.min(2.0, reachMargin));
+        lowHealthHp = Math.max(1, Math.min(19, lowHealthHp));
+        if (baritoneCancelCommand == null || baritoneCancelCommand.isBlank()) baritoneCancelCommand = "#cancel";
         depositThreshold = Math.max(32, Math.min(640, Math.round(depositThreshold / 32.0F) * 32));
         scanIntervalTicks = Math.max(1, Math.min(100, scanIntervalTicks));
         pickaxeSlot = Math.max(1, Math.min(9, pickaxeSlot));

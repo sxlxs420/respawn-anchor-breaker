@@ -2,6 +2,7 @@ package com.respawnanchorbreaker;
 
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.gui.screens.inventory.InventoryScreen;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.minecraft.client.player.LocalPlayer;
@@ -89,6 +90,19 @@ public final class AnchorController {
     private int chestPickupUntil;
     private int anchorCountTimer;
 
+    // health / totem guard state
+    private boolean recovering;
+    private int recTicks;
+    private int recoverCooldownUntil;
+    private int lastCancelTick = -1000;
+    private enum Tot { NONE, OPENING, WAIT, CLOSING }
+    private Tot tot = Tot.NONE;
+    private boolean offInit;
+    private boolean lastOffTotem;
+    private int popCandidateUntil = -1;
+    private int totTicks;
+    private int totWait;
+
     // pickup state
     private ItemEntity pickup;
     private int itemScanClock = 1000;
@@ -138,6 +152,8 @@ public final class AnchorController {
             mc.options.keyUse.setDown(false);
             useTapPending = false;
         }
+        trackTotem(mc, cfg);
+        if (tot != Tot.NONE && tickTotem(mc)) return;
         if (dep != Dep.NONE && mc.player != null && mc.level != null && containerOpen(mc)) {
             if (dep == Dep.OPEN) enterTransfer();
             if (dep == Dep.TRANSFER) {
@@ -155,12 +171,18 @@ public final class AnchorController {
         ignoredItems.values().removeIf(exp -> exp <= clock);
         if (eatDelay > 0) eatDelay--;
 
+        // ---- health guard: cancel Baritone, eat until full, wait for full health, then resume
+        if (cfg.healthGuard && !recovering && clock >= recoverCooldownUntil && !player.isCreative()
+                && player.getHealth() < cfg.lowHealthHp) {
+            beginRecovery(mc, player, cfg);
+        }
+
         // ---- dropped anchor pickup (takes over only when we are not mid-break)
         if (pickup != null && !pickupStillValid(player, cfg)) {
             endPickup(mc);
         }
-        if (pickup == null && (cfg.autoPickup || clock < chestPickupUntil) && !wantAttack && !eating
-                && ++itemScanClock >= 5) {
+        if (pickup == null && !recovering && (cfg.autoPickup || clock < chestPickupUntil) && !wantAttack
+                && !eating && ++itemScanClock >= 5) {
             itemScanClock = 0;
             ItemEntity found = findDroppedAnchor(level, player, PICKUP_RADIUS);
             if (found != null) {
@@ -181,11 +203,12 @@ public final class AnchorController {
         stopWalking(mc);
 
         // ---- eating after each anchor (only when not mid-break)
-        if (cfg.autoEat && eatPending > 0 && eatDelay == 0 && !wantAttack) {
+        if ((cfg.autoEat || recovering) && eatPending > 0 && eatDelay == 0 && !wantAttack) {
             if (tickEating(mc, player, level, cfg)) return;
         } else if (eating || eatKeysDown) {
             stopEating(mc);
         }
+        if (recovering && tickRecovery(mc, player, cfg)) return;
 
         // ---- deposit anchors into an ender chest
         if (dep == Dep.NONE && cfg.depositAnchors && clock >= depositCooldownUntil && !wantAttack
@@ -490,9 +513,7 @@ public final class AnchorController {
         if (!cfg.baritoneGoto || minedSinceGoto <= 0) return;
         if (pickup != null || eatPending > 0 || eating || dep != Dep.NONE) return;
         if (clock - lastBreakTick < 40) return;
-        ClientPacketListener conn = mc.getConnection();
-        if (conn == null) return;
-        conn.sendChat(cfg.gotoCommand);
+        sendChatCommand(mc, cfg.gotoCommand);
         minedSinceGoto = 0;
     }
 
@@ -799,6 +820,163 @@ public final class AnchorController {
             return;
         }
         wantAttack = true;
+    }
+
+
+    // ---------------------------------------------------------------- health and totem guard
+
+    private void sendChatCommand(Minecraft mc, String text) {
+        ClientPacketListener conn = mc.getConnection();
+        if (conn != null && text != null && !text.isBlank()) conn.sendChat(text);
+    }
+
+    private void cancelBaritone(Minecraft mc, Config cfg) {
+        if (!cfg.baritoneGoto || clock - lastCancelTick < 100) return;
+        lastCancelTick = clock;
+        sendChatCommand(mc, cfg.baritoneCancelCommand);
+    }
+
+    private void beginRecovery(Minecraft mc, LocalPlayer player, Config cfg) {
+        recovering = true;
+        recTicks = 0;
+        clearTarget(mc);
+        stopWalking(mc);
+        if (pickup != null) endPickup(mc);
+        if (dep != Dep.NONE && dep != Dep.TRANSFER) endDeposit(mc, 0);
+        cancelBaritone(mc, cfg);
+        eatPending = 40;                  // "until full": tickEating stops by itself once the hunger bar is full
+        eatDelay = 10 + rng.nextInt(10);  // Baritone needs a moment to stop, and so would a person
+        notice(mc, "low health, Baritone cancelled, eating.");
+    }
+
+    /** True while recovery owns the tick (eating, or standing still while health regenerates). */
+    private boolean tickRecovery(Minecraft mc, LocalPlayer player, Config cfg) {
+        if (eatPending > 0) return true;
+        if (player.getHealth() >= player.getMaxHealth()) {
+            endRecovery(mc, true);
+            return false;
+        }
+        recTicks++;
+        if (recTicks % 200 == 0 && player.canEat(false)) { // still hungry: try the food again
+            eatPending = 10;
+            eatDelay = 5 + rng.nextInt(10);
+            return true;
+        }
+        if (recTicks > 6000) {
+            endRecovery(mc, false);
+            notice(mc, "health isn't refilling, carrying on.");
+            return false;
+        }
+        return true;
+    }
+
+    private void endRecovery(Minecraft mc, boolean success) {
+        recovering = false;
+        eatPending = 0;
+        if (success) {
+            // let the normal idle logic send the goto again as soon as there is nothing left to mine
+            minedSinceGoto = Math.max(1, minedSinceGoto);
+            lastBreakTick = clock - 100;
+            notice(mc, "health restored, resuming.");
+        } else {
+            recoverCooldownUntil = clock + 600;
+        }
+    }
+
+    private int spareTotems(LocalPlayer p) {
+        int n = 0;
+        Inventory inv = p.getInventory();
+        for (int i = 0; i < 36; i++) {
+            if (inv.getItem(i).is(Items.TOTEM_OF_UNDYING)) n += inv.getItem(i).getCount();
+        }
+        return n;
+    }
+
+    /** A pop looks like: offhand totem vanishes with no screen open, and health drops to ~1. */
+    private void trackTotem(Minecraft mc, Config cfg) {
+        LocalPlayer p = mc.player;
+        if (p == null || mc.level == null || !cfg.totemGuard) {
+            offInit = false;
+            return;
+        }
+        boolean has = p.getOffhandItem().is(Items.TOTEM_OF_UNDYING);
+        if (offInit && lastOffTotem && !has && mc.gui.screen() == null && tot == Tot.NONE) {
+            popCandidateUntil = clock + 10;
+        }
+        lastOffTotem = has;
+        offInit = true;
+        if (popCandidateUntil >= 0) {
+            if (clock > popCandidateUntil) {
+                popCandidateUntil = -1;
+            } else if (!has && p.getHealth() <= 2.0F && tot == Tot.NONE) {
+                popCandidateUntil = -1;
+                onTotemPop(mc, p, cfg);
+            }
+        }
+    }
+
+    private void onTotemPop(Minecraft mc, LocalPlayer p, Config cfg) {
+        notice(mc, "totem popped!");
+        cancelBaritone(mc, cfg);
+        clearTarget(mc);
+        stopWalking(mc);
+        stopEating(mc);
+        if (pickup != null) endPickup(mc);
+        if (dep != Dep.NONE && dep != Dep.TRANSFER) endDeposit(mc, 0);
+        if (spareTotems(p) == 0) {
+            notice(mc, "no spare totem in your inventory.");
+            return;
+        }
+        tot = Tot.OPENING;
+        totTicks = 0;
+        totWait = 3 + rng.nextInt(6); // a beat before reaching for the inventory
+    }
+
+    /** Opens the inventory, waits for AutoTotem to fill the offhand, then closes it. True while it owns the tick. */
+    private boolean tickTotem(Minecraft mc) {
+        LocalPlayer p = mc.player;
+        if (p == null) {
+            tot = Tot.NONE;
+            return false;
+        }
+        boolean has = p.getOffhandItem().is(Items.TOTEM_OF_UNDYING);
+        switch (tot) {
+            case OPENING -> {
+                if (has) { // AutoTotem was already quick enough
+                    tot = Tot.NONE;
+                    return false;
+                }
+                if (totWait-- > 0) return true;
+                mc.gui.setScreen(new InventoryScreen(p));
+                tot = Tot.WAIT;
+                totTicks = 0;
+            }
+            case WAIT -> {
+                if (!(mc.gui.screen() instanceof InventoryScreen)) { // you closed it yourself
+                    tot = Tot.NONE;
+                    return false;
+                }
+                if (has) {
+                    tot = Tot.CLOSING;
+                    totWait = 4 + rng.nextInt(6);
+                } else if (++totTicks > 400) {
+                    notice(mc, "no totem reached your offhand, closing the inventory.");
+                    tot = Tot.CLOSING;
+                    totWait = 4 + rng.nextInt(6);
+                }
+            }
+            case CLOSING -> {
+                if (totWait-- > 0) return true;
+                Screen s = mc.gui.screen();
+                if (s instanceof InventoryScreen) s.onClose();
+                tot = Tot.NONE;
+                return false;
+            }
+            default -> {
+                return false;
+            }
+        }
+        return true;
     }
 
     // ---------------------------------------------------------------- helpers

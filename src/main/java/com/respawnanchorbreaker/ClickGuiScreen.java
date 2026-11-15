@@ -74,6 +74,8 @@ public final class ClickGuiScreen extends Screen {
     private String selected;
     private boolean onlyEnabled;
     private Entry dragging;
+    private boolean overlayDrag;
+    private double ovOffX, ovOffY;
     private int dragX, dragW;
 
     // layout (recomputed every frame)
@@ -94,6 +96,10 @@ public final class ClickGuiScreen extends Screen {
         entries.add(new Entry("Deposit", "Deposit Anchors", "Store them in an ender chest", () -> c.depositAnchors, v -> c.depositAnchors = v));
         entries.add(new Entry("Deposit", "Deposit At", "Anchors carried before depositing", () -> c.depositThreshold, v -> c.depositThreshold = v, 32, 640, 32));
         entries.add(new Entry("Deposit", "Retrieve Chest", "Mine it back (Silk Touch)", () -> c.retrieveChest, v -> c.retrieveChest = v));
+        entries.add(new Entry("Safety", "Health Guard", "Cancel Baritone and eat if low", () -> c.healthGuard, v -> c.healthGuard = v));
+        entries.add(new Entry("Safety", "Low Health (HP)", "2 HP = 1 heart, 5 = 2.5 hearts", () -> c.lowHealthHp, v -> c.lowHealthHp = v, 1, 19));
+        entries.add(new Entry("Safety", "Totem Guard", "Open inventory after a pop", () -> c.totemGuard, v -> c.totemGuard = v));
+        entries.add(new Entry("Display", "Overlay", "Show the draggable credit card", () -> c.showOverlay, v -> c.showOverlay = v));
         entries.add(new Entry("Baritone", "Baritone Goto", "Sends #goto when none are left", () -> c.baritoneGoto, v -> c.baritoneGoto = v));
 
         Map<String, Boolean> seen = new LinkedHashMap<>();
@@ -273,6 +279,8 @@ public final class ClickGuiScreen extends Screen {
                 text(g, v, minusX + 12 + (26 - this.font.width(v)) / 2, by + 2, ACCENT);
             }
         }
+
+        Overlay.draw(g); // drag it by its body
     }
 
     // ---------------------------------------------------------------- input
@@ -284,6 +292,15 @@ public final class ClickGuiScreen extends Screen {
         if (btn != 0 && btn != 1) return super.mouseClicked(event, doubleClick);
         double mx = event.x(), my = event.y();
         layout();
+
+        // the credit card overlay is draggable and sits on top of the menu
+        if (Overlay.hit(mx, my)) {
+            net.minecraft.client.Minecraft mcInst = net.minecraft.client.Minecraft.getInstance();
+            overlayDrag = true;
+            ovOffX = mx - Overlay.x(mcInst);
+            ovOffY = my - Overlay.y(mcInst);
+            return true;
+        }
 
         // categories
         for (int i = 0; i < categories.size(); i++) {
@@ -347,12 +364,22 @@ public final class ClickGuiScreen extends Screen {
     // Not annotated with @Override on purpose: if a signature differs in this version the slider
     // still works by clicking; with the right signature, dragging works too.
     public boolean mouseDragged(MouseButtonEvent event, double dragXd, double dragYd) {
+        if (overlayDrag) {
+            Config c = Config.get();
+            c.overlayX = (int) (event.x() - ovOffX);
+            c.overlayY = (int) (event.y() - ovOffY);
+            return true;
+        }
         if (dragging == null) return false;
         setSlider(dragging, event.x());
         return true;
     }
 
     public boolean mouseReleased(MouseButtonEvent event) {
+        if (overlayDrag) {
+            overlayDrag = false;
+            Config.save();
+        }
         dragging = null;
         return false;
     }

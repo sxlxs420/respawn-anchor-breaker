@@ -3,8 +3,8 @@
   "id": "respawn_anchor_breaker",
   "version": "${version}",
   "name": "Respawn Anchor Breaker",
-  "description": "Client-side: smoothly looks at and breaks nearby respawn anchors, one after another.",
-  "authors": ["You"],
+  "description": "Anchor addon for Temple Client + Baritone: breaks nearby respawn anchors, eats, deposits and stays safe. By sxlxs420.",
+  "authors": ["sxlxs420"],
   "license": "MIT",
   "environment": "client",
   "entrypoints": {

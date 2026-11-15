@@ -6,6 +6,7 @@ import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.input.KeyEvent;
 import net.minecraft.client.input.MouseButtonEvent;
 import net.minecraft.network.chat.Component;
+import net.minecraft.util.Mth;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -43,18 +44,26 @@ public final class ClickGuiScreen extends Screen {
         final Consumer<Boolean> setB;
         final IntSupplier getI;
         final IntConsumer setI;
-        final int min, max;
+        final int min, max, step;
+        final boolean slider;
 
         Entry(String category, String name, String desc, BooleanSupplier getB, Consumer<Boolean> setB) {
             this.category = category; this.name = name; this.desc = desc;
             this.getB = getB; this.setB = setB;
-            this.getI = null; this.setI = null; this.min = 0; this.max = 0;
+            this.getI = null; this.setI = null; this.min = 0; this.max = 0; this.step = 1; this.slider = false;
         }
 
         Entry(String category, String name, String desc, IntSupplier getI, IntConsumer setI, int min, int max) {
             this.category = category; this.name = name; this.desc = desc;
             this.getB = null; this.setB = null;
-            this.getI = getI; this.setI = setI; this.min = min; this.max = max;
+            this.getI = getI; this.setI = setI; this.min = min; this.max = max; this.step = 1; this.slider = false;
+        }
+
+        /** Slider: drag or click along the track; snaps to multiples of step. */
+        Entry(String category, String name, String desc, IntSupplier getI, IntConsumer setI, int min, int max, int step) {
+            this.category = category; this.name = name; this.desc = desc;
+            this.getB = null; this.setB = null;
+            this.getI = getI; this.setI = setI; this.min = min; this.max = max; this.step = step; this.slider = true;
         }
 
         boolean isToggle() { return getB != null; }
@@ -64,6 +73,8 @@ public final class ClickGuiScreen extends Screen {
     private final List<String> categories = new ArrayList<>();
     private String selected;
     private boolean onlyEnabled;
+    private Entry dragging;
+    private int dragX, dragW;
 
     // layout (recomputed every frame)
     private int px, py, pw, ph;
@@ -79,8 +90,10 @@ public final class ClickGuiScreen extends Screen {
         entries.add(new Entry("Tools", "Food Slot", "Hotbar slot of your food", () -> c.foodSlot, v -> c.foodSlot = v, 1, 9));
         entries.add(new Entry("Tools", "Eat Count", "Pieces to eat per anchor", () -> c.eatCount, v -> c.eatCount = v, 1, 10));
         entries.add(new Entry("Movement", "Auto Pickup", "Walk to dropped anchors", () -> c.autoPickup, v -> c.autoPickup = v));
-        entries.add(new Entry("Movement", "Sprint Jump", "Hop while Baritone paths", () -> c.autoHop, v -> c.autoHop = v));
         entries.add(new Entry("Movement", "Max Drop", "Biggest fall it will walk off", () -> c.maxDropBlocks, v -> c.maxDropBlocks = v, 1, 64));
+        entries.add(new Entry("Deposit", "Deposit Anchors", "Store them in an ender chest", () -> c.depositAnchors, v -> c.depositAnchors = v));
+        entries.add(new Entry("Deposit", "Deposit At", "Anchors carried before depositing", () -> c.depositThreshold, v -> c.depositThreshold = v, 32, 640, 32));
+        entries.add(new Entry("Deposit", "Retrieve Chest", "Mine it back (Silk Touch)", () -> c.retrieveChest, v -> c.retrieveChest = v));
         entries.add(new Entry("Baritone", "Baritone Goto", "Sends #goto when none are left", () -> c.baritoneGoto, v -> c.baritoneGoto = v));
 
         Map<String, Boolean> seen = new LinkedHashMap<>();
@@ -217,6 +230,19 @@ public final class ClickGuiScreen extends Screen {
             int cx = cardX(i), cy = cardY(i);
             box(g, cx, cy, cw, CARD_H, in(mouseX, mouseY, cx, cy, cw, CARD_H) ? CARD_HOVER : CARD);
 
+            if (e.slider) {
+                int v = e.getI.getAsInt();
+                String vs = v + " (" + stackLabel(v) + ")";
+                text(g, e.name, cx + 8, cy + 6, TEXT);
+                text(g, vs, cx + cw - 8 - this.font.width(vs), cy + 6, ACCENT);
+                int tx = cx + 8, tw = cw - 16, ty = cy + 22;
+                box(g, tx, ty, tw, 4, TRACK_OFF);
+                int fw = (int) ((long) (v - e.min) * tw / Math.max(1, e.max - e.min));
+                if (fw > 0) box(g, tx, ty, Math.max(2, fw), 4, ACCENT);
+                box(g, tx + fw - 3, ty - 3, 6, 10, KNOB);
+                continue;
+            }
+
             int rightW = e.isToggle() ? 42 : 56;
             int textW = cw - 16 - rightW;
             text(g, fit(e.name, textW), cx + 8, cy + 7, TEXT);
@@ -253,7 +279,9 @@ public final class ClickGuiScreen extends Screen {
 
     @Override
     public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
-        if (event.button() != 0) return super.mouseClicked(event, doubleClick);
+        // Minecraft 26.3 uses SDL mouse buttons: left = 1 (older GLFW numbering used 0).
+        int btn = event.button();
+        if (btn != 0 && btn != 1) return super.mouseClicked(event, doubleClick);
         double mx = event.x(), my = event.y();
         layout();
 
@@ -279,6 +307,13 @@ public final class ClickGuiScreen extends Screen {
             Entry e = list.get(i);
             int cx = cardX(i), cy = cardY(i);
             if (!in(mx, my, cx, cy, cw, CARD_H)) continue;
+            if (e.slider) {
+                dragging = e;
+                dragX = cx + 8;
+                dragW = cw - 16;
+                setSlider(e, mx);
+                return true;
+            }
             if (e.isToggle()) {
                 e.setB.accept(!e.getB.getAsBoolean());
             } else {
@@ -292,6 +327,34 @@ public final class ClickGuiScreen extends Screen {
             return true;
         }
         return super.mouseClicked(event, doubleClick);
+    }
+
+    /** 32 -> "half a stack", 64 -> "1 stack", 96 -> "1.5 stacks" (anchors stack to 64). */
+    private static String stackLabel(int count) {
+        if (count == 32) return "half a stack";
+        double stacks = count / 64.0;
+        String n = (count % 64 == 0) ? Integer.toString(count / 64) : Double.toString(stacks);
+        return n + (count == 64 ? " stack" : " stacks");
+    }
+
+    private void setSlider(Entry e, double mx) {
+        double t = Mth.clamp((mx - dragX) / Math.max(1, dragW), 0.0, 1.0);
+        double raw = e.min + t * (e.max - e.min);
+        int snapped = e.min + (int) Math.round((raw - e.min) / e.step) * e.step;
+        e.setI.accept(Mth.clamp(snapped, e.min, e.max));
+    }
+
+    // Not annotated with @Override on purpose: if a signature differs in this version the slider
+    // still works by clicking; with the right signature, dragging works too.
+    public boolean mouseDragged(MouseButtonEvent event, double dragXd, double dragYd) {
+        if (dragging == null) return false;
+        setSlider(dragging, event.x());
+        return true;
+    }
+
+    public boolean mouseReleased(MouseButtonEvent event) {
+        dragging = null;
+        return false;
     }
 
     @Override

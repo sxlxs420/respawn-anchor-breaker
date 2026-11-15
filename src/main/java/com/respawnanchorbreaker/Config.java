@@ -23,8 +23,12 @@ public final class Config {
     public double reachMargin = 0.3;
     /** Also mine a snow layer on/next to an anchor when it blocks the view of it. */
     public boolean clearSnow = true;
-    /** Sprint-jump while Baritone is pathing to the next anchor (only on flat, clear ground). */
-    public boolean autoHop = true;
+    /** Put anchors into an ender chest (placed from your hotbar) once you carry depositThreshold of them. */
+    public boolean depositAnchors = false;
+    /** Anchors carried before depositing: 32 (half a stack) to 640 (10 stacks), in steps of 32. */
+    public int depositThreshold = 320;
+    /** After depositing, mine the ender chest back (needs a Silk Touch pickaxe in the pickaxe slot). */
+    public boolean retrieveChest = true;
     /** How often (in ticks) to scan for anchors while no target is selected (1-100). */
     public int scanIntervalTicks = 10;
     /** Switch to the pickaxe hotbar slot before breaking an anchor. */
@@ -81,6 +85,7 @@ public final class Config {
 
     private void sanitize() {
         reachMargin = Math.max(0.0, Math.min(2.0, reachMargin));
+        depositThreshold = Math.max(32, Math.min(640, Math.round(depositThreshold / 32.0F) * 32));
         scanIntervalTicks = Math.max(1, Math.min(100, scanIntervalTicks));
         pickaxeSlot = Math.max(1, Math.min(9, pickaxeSlot));
         maxDropBlocks = Math.max(1, Math.min(64, maxDropBlocks));

@@ -1,16 +1,22 @@
 package com.respawnanchorbreaker;
 
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.network.chat.Component;
 import net.minecraft.tags.BlockTags;
 import net.minecraft.tags.FluidTags;
 import net.minecraft.util.Mth;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.inventory.AbstractContainerMenu;
+import net.minecraft.world.inventory.ContainerInput;
+import net.minecraft.world.inventory.Slot;
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.block.Blocks;
@@ -61,13 +67,27 @@ public final class AnchorController {
     private int minedSinceGoto;
     private int lastBreakTick = -1000;
 
-    // sprint-jump state
-    private boolean pathing;          // true after we sent the goto command, until we start working again
-    private int gotoSentTick = -100000;
-    private boolean hopDown;
-    private int hopCooldown;
-    private int hopScan = 1000;
-    private boolean anchorClose;
+    // ender-chest deposit state
+    private enum Dep { NONE, PLACE, OPEN, TRANSFER, RETRIEVE }
+    private Dep dep = Dep.NONE;
+    private int depTicks;
+    private int depWait;
+    private int placeTries;
+    private int openTries;
+    private BlockPos chestFloor;
+    private BlockPos chestPos;
+    private Vec3 chestAim;
+    private Vec3 chestOpenAim;
+    private int transferWait;
+    private int lastMovedSlot = -1;
+    private int lastMovedCount = -1;
+    private int stuckMoves;
+    private boolean finishing;
+    private boolean depSneak;
+    private boolean useTapPending;
+    private int depositCooldownUntil;
+    private int chestPickupUntil;
+    private int anchorCountTimer;
 
     // pickup state
     private ItemEntity pickup;
@@ -87,10 +107,9 @@ public final class AnchorController {
             releaseAttack(mc);
             stopWalking(mc);
             stopEating(mc);
-            releaseHop(mc);
             return;
         }
-        if (target == null) {
+        if (breakBlock == null) {
             releaseAttack(mc);
             return;
         }
@@ -115,12 +134,21 @@ public final class AnchorController {
         }
 
         clock++;
+        if (useTapPending) { // a use "click" is a single-tick key press
+            mc.options.keyUse.setDown(false);
+            useTapPending = false;
+        }
+        if (dep != Dep.NONE && mc.player != null && mc.level != null && containerOpen(mc)) {
+            if (dep == Dep.OPEN) enterTransfer();
+            if (dep == Dep.TRANSFER) {
+                tickTransfer(mc, cfg);
+                return;
+            }
+        }
         if (!active(mc)) {
             reset(mc);
             return;
         }
-        releaseHop(mc); // a hop is a single-tick key tap
-        if (pickup != null || eating || target != null) pathing = false;
         LocalPlayer player = mc.player;
         ClientLevel level = mc.level;
         ignoredUntil.values().removeIf(exp -> exp <= clock);
@@ -131,7 +159,8 @@ public final class AnchorController {
         if (pickup != null && !pickupStillValid(player, cfg)) {
             endPickup(mc);
         }
-        if (pickup == null && cfg.autoPickup && !wantAttack && !eating && ++itemScanClock >= 5) {
+        if (pickup == null && (cfg.autoPickup || clock < chestPickupUntil) && !wantAttack && !eating
+                && ++itemScanClock >= 5) {
             itemScanClock = 0;
             ItemEntity found = findDroppedAnchor(level, player, PICKUP_RADIUS);
             if (found != null) {
@@ -158,6 +187,19 @@ public final class AnchorController {
             stopEating(mc);
         }
 
+        // ---- deposit anchors into an ender chest
+        if (dep == Dep.NONE && cfg.depositAnchors && clock >= depositCooldownUntil && !wantAttack
+                && eatPending == 0 && ++anchorCountTimer >= 10) {
+            anchorCountTimer = 0;
+            if (countAnchors(player) >= cfg.depositThreshold && playerStill(player)) {
+                startDeposit(mc, player, level, cfg);
+            }
+        }
+        if (dep != Dep.NONE) {
+            tickDeposit(mc, player, level, cfg);
+            return;
+        }
+
         // ---- anchor breaking
         if (target != null && !stillValid(player, level)) {
             if (ticksOnTarget > 0 && !level.getBlockState(target).is(Blocks.RESPAWN_ANCHOR)) {
@@ -174,7 +216,6 @@ public final class AnchorController {
             }
             if (target == null) {
                 wantAttack = false;
-                tickHop(mc, player, level, cfg);
                 return;
             }
         }
@@ -228,15 +269,20 @@ public final class AnchorController {
     // ---------------------------------------------------------------- pickup
 
     private boolean pickupStillValid(LocalPlayer player, Config cfg) {
-        if (pickup.isRemoved() || !pickup.getItem().is(Items.RESPAWN_ANCHOR)) return false;
+        if (pickup.isRemoved() || !wantedItem(pickup.getItem())) return false;
         double max = PICKUP_RADIUS + 2.0;
         return pickup.position().distanceToSqr(player.position()) <= max * max;
+    }
+
+    private boolean wantedItem(ItemStack st) {
+        return (Config.get().autoPickup && st.is(Items.RESPAWN_ANCHOR))
+                || (clock < chestPickupUntil && st.is(Items.ENDER_CHEST));
     }
 
     private ItemEntity findDroppedAnchor(ClientLevel level, LocalPlayer player, int radius) {
         AABB box = player.getBoundingBox().inflate(radius);
         List<ItemEntity> items = level.getEntitiesOfClass(ItemEntity.class, box,
-                e -> !e.isRemoved() && e.getItem().is(Items.RESPAWN_ANCHOR));
+                e -> !e.isRemoved() && wantedItem(e.getItem()));
         Vec3 pp = player.position();
         ItemEntity best = null;
         double bestD = Double.MAX_VALUE;
@@ -442,99 +488,317 @@ public final class AnchorController {
     /** Once everything nearby is mined, picked up and eaten, tell Baritone to go to the next anchor. */
     private void maybeSendGoto(Minecraft mc, Config cfg) {
         if (!cfg.baritoneGoto || minedSinceGoto <= 0) return;
-        if (pickup != null || eatPending > 0 || eating) return;
+        if (pickup != null || eatPending > 0 || eating || dep != Dep.NONE) return;
         if (clock - lastBreakTick < 40) return;
         ClientPacketListener conn = mc.getConnection();
         if (conn == null) return;
         conn.sendChat(cfg.gotoCommand);
         minedSinceGoto = 0;
-        pathing = true;
-        gotoSentTick = clock;
     }
 
 
-    // ---------------------------------------------------------------- sprint jumping
 
-    private void releaseHop(Minecraft mc) {
-        if (hopDown) {
-            mc.options.keyJump.setDown(false);
-            hopDown = false;
+    // ---------------------------------------------------------------- ender chest deposit
+
+    private int countAnchors(LocalPlayer p) {
+        int n = 0;
+        Inventory inv = p.getInventory();
+        for (int i = 0; i < inv.getContainerSize(); i++) {
+            ItemStack st = inv.getItem(i);
+            if (st.is(Items.RESPAWN_ANCHOR)) n += st.getCount();
+        }
+        return n;
+    }
+
+    private int findHotbarSlot(LocalPlayer p, net.minecraft.world.item.Item item) {
+        Inventory inv = p.getInventory();
+        for (int i = 0; i < 9; i++) {
+            if (inv.getItem(i).is(item)) return i;
+        }
+        return -1;
+    }
+
+    private boolean playerStill(LocalPlayer p) {
+        Vec3 d = p.getDeltaMovement();
+        return Math.hypot(d.x, d.z) < 0.03;
+    }
+
+    private boolean containerOpen(Minecraft mc) {
+        return mc.player != null && mc.gui.screen() != null && mc.player.containerMenu != mc.player.inventoryMenu;
+    }
+
+    private void notice(Minecraft mc, String msg) {
+        if (mc.player != null) mc.player.sendSystemMessage(Component.literal("Anchor Breaker: " + msg));
+    }
+
+    private double jit(double width) {
+        return (rng.nextDouble() - 0.5) * width;
+    }
+
+    private void releaseDepKeys(Minecraft mc) {
+        if (useTapPending) {
+            mc.options.keyUse.setDown(false);
+            useTapPending = false;
+        }
+        if (depSneak) {
+            mc.options.keyShift.setDown(false);
+            depSneak = false;
         }
     }
 
-    /**
-     * While Baritone is pathing to the next anchor and we have nothing else to do, tap jump whenever it is
-     * clearly safe: sprinting on flat ground with clear space ahead. Anything that looks like a step, gap,
-     * drop, low ceiling, liquid or ladder is left to Baritone (that's its parkour/precise movement).
-     */
-    private void tickHop(Minecraft mc, LocalPlayer player, ClientLevel level, Config cfg) {
-        if (!cfg.autoHop || !pathing) return;
-        if (clock - gotoSentTick > 2400) { // 2 minutes: Baritone is surely done or gave up
-            pathing = false;
+    private void startDeposit(Minecraft mc, LocalPlayer player, ClientLevel level, Config cfg) {
+        if (findHotbarSlot(player, Items.ENDER_CHEST) < 0) {
+            notice(mc, "deposit skipped, put an ender chest in your hotbar.");
+            depositCooldownUntil = clock + 1200;
             return;
         }
-        if (hopCooldown > 0) {
-            hopCooldown--;
+        if (!findChestSpot(level, player)) {
+            notice(mc, "deposit skipped, no good spot to place the ender chest here.");
+            depositCooldownUntil = clock + 400;
             return;
         }
-        if (mc.options.keyJump.isDown()) return; // Baritone (or you) is already jumping
-        if (!hopSafe(level, player)) return;
-
-        if (++hopScan >= 5) {
-            hopScan = 0;
-            anchorClose = anchorWithin(level, player.getEyePosition(), 6.0);
-        }
-        if (anchorClose) return; // about to work: don't overshoot
-
-        mc.options.keyJump.setDown(true);
-        hopDown = true;
-        hopCooldown = 2;
+        clearTarget(mc);
+        stopWalking(mc);
+        dep = Dep.PLACE;
+        depTicks = 0;
+        depWait = 4 + rng.nextInt(7); // a moment to "notice" the inventory is full
+        placeTries = 0;
+        openTries = 0;
     }
 
-    private boolean hopSafe(ClientLevel level, LocalPlayer player) {
-        if (!player.onGround() || !player.isSprinting()) return false;
-        if (player.isInWater() || player.isInLava() || player.onClimbable() || player.isFallFlying()) return false;
-
-        Vec3 d = player.getDeltaMovement();
-        double hs = Math.hypot(d.x, d.z);
-        if (hs < 0.15) return false; // not really moving
-        double ux = d.x / hs, uz = d.z / hs;
-        Vec3 pos = player.position();
-
-        // 4 blocks of headroom for the jump itself, and for the next 3 blocks ahead:
-        // clear body space, solid flat ground below, no liquids or hazards.
-        for (int i = 0; i <= 3; i++) {
-            BlockPos col = BlockPos.containing(pos.x + ux * i, pos.y, pos.z + uz * i);
-            for (int h = 0; h <= 3; h++) {
-                BlockPos bp = col.above(h);
-                BlockState st = level.getBlockState(bp);
-                if (!st.getCollisionShape(level, bp).isEmpty() || !st.getFluidState().isEmpty() || hazard(st)) {
-                    // the block at our own feet column counts too: standing in something odd -> don't hop
-                    return false;
+    /** Picks a floor block near you whose top face can take the chest, with a clear view of it. */
+    private boolean findChestSpot(ClientLevel level, LocalPlayer player) {
+        Vec3 eye = player.getEyePosition();
+        BlockPos feet = player.blockPosition();
+        double reach = player.blockInteractionRange() - 0.4;
+        List<BlockPos> cands = new ArrayList<>();
+        for (int dx = -2; dx <= 2; dx++) {
+            for (int dz = -2; dz <= 2; dz++) {
+                for (int dy = -1; dy <= 0; dy++) {
+                    if (dx == 0 && dz == 0 && dy == -1) continue; // that's the block we stand on
+                    cands.add(feet.offset(dx, dy, dz)); // floor block level: just below our feet, or one up
                 }
             }
-            if (i == 0) continue;
-            BlockPos below = col.below();
-            BlockState bs = level.getBlockState(below);
-            if (bs.getCollisionShape(level, below).isEmpty() || hazard(bs)) return false; // gap or drop ahead
         }
-        return true;
-    }
-
-    private boolean anchorWithin(ClientLevel level, Vec3 eye, double r) {
-        BlockPos o = BlockPos.containing(eye);
-        int n = (int) Math.ceil(r);
-        BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
-        for (int dx = -n; dx <= n; dx++) {
-            for (int dy = -n; dy <= n; dy++) {
-                for (int dz = -n; dz <= n; dz++) {
-                    m.set(o.getX() + dx, o.getY() + dy, o.getZ() + dz);
-                    if (level.getBlockState(m).is(Blocks.RESPAWN_ANCHOR)
-                            && eye.distanceToSqr(Vec3.atCenterOf(m)) <= r * r) return true;
-                }
-            }
+        cands.sort((a, b) -> Double.compare(
+                eye.distanceToSqr(Vec3.atCenterOf(a)), eye.distanceToSqr(Vec3.atCenterOf(b))));
+        for (BlockPos floor : cands) {
+            if (!spotOk(level, player, floor)) continue;
+            Vec3 aim = new Vec3(floor.getX() + 0.5 + jit(0.4), floor.getY() + 0.98, floor.getZ() + 0.5 + jit(0.4));
+            if (eye.distanceTo(aim) > reach) continue;
+            BlockHitResult hit = level.clip(new ClipContext(
+                    eye, aim, ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, player));
+            if (hit.getType() != HitResult.Type.BLOCK || !hit.getBlockPos().equals(floor)
+                    || hit.getDirection() != Direction.UP) continue;
+            chestFloor = floor.immutable();
+            chestPos = floor.above().immutable();
+            chestAim = aim;
+            return true;
         }
         return false;
+    }
+
+    private boolean spotOk(ClientLevel level, LocalPlayer player, BlockPos floor) {
+        BlockState fs = level.getBlockState(floor);
+        if (fs.is(Blocks.RESPAWN_ANCHOR) || hazard(fs)) return false;
+        if (!fs.isFaceSturdy(level, floor, Direction.UP)) return false;
+        BlockPos above = floor.above();
+        BlockState as = level.getBlockState(above);
+        if (!(as.isAir() || as.canBeReplaced()) || !as.getFluidState().isEmpty() || hazard(as)) return false;
+        BlockPos lid = above.above();
+        if (!level.getBlockState(lid).getCollisionShape(level, lid).isEmpty()) return false; // lid must open
+        return !new AABB(above).intersects(player.getBoundingBox());
+    }
+
+    private boolean hitsBlock(Minecraft mc, BlockPos pos, Direction face) {
+        LocalPlayer p = mc.player;
+        if (p == null || pos == null) return false;
+        HitResult own = p.pick(p.blockInteractionRange(), 1.0F, false);
+        if (!(own instanceof BlockHitResult ob) || ob.getType() != HitResult.Type.BLOCK
+                || !ob.getBlockPos().equals(pos) || (face != null && ob.getDirection() != face)) return false;
+        return mc.hitResult instanceof BlockHitResult mb
+                && mb.getType() == HitResult.Type.BLOCK
+                && mb.getBlockPos().equals(pos)
+                && (face == null || mb.getDirection() == face);
+    }
+
+    private void endDeposit(Minecraft mc, int cooldownTicks) {
+        releaseDepKeys(mc);
+        releaseAttack(mc);
+        breakBlock = null;
+        wantAttack = false;
+        dep = Dep.NONE;
+        depositCooldownUntil = clock + cooldownTicks;
+    }
+
+    private void abortDeposit(Minecraft mc, String why) {
+        notice(mc, why);
+        endDeposit(mc, 600);
+    }
+
+    private void tickDeposit(Minecraft mc, LocalPlayer player, ClientLevel level, Config cfg) {
+        if (++depTicks > 700) {
+            abortDeposit(mc, "deposit timed out.");
+            return;
+        }
+        if (depWait > 0) {
+            depWait--;
+            return;
+        }
+        switch (dep) {
+            case PLACE -> placeChest(mc, player, level);
+            case OPEN -> openChest(mc, player, level, cfg);
+            case RETRIEVE -> retrieveChest(mc, player, level, cfg);
+            case TRANSFER -> afterTransfer(mc, cfg); // container is gone (we closed it, or you did)
+            default -> { }
+        }
+    }
+
+    private void placeChest(Minecraft mc, LocalPlayer player, ClientLevel level) {
+        if (level.getBlockState(chestPos).is(Blocks.ENDER_CHEST)) { // it's down
+            releaseDepKeys(mc);
+            chestOpenAim = new Vec3(chestPos.getX() + 0.5 + jit(0.3), chestPos.getY() + 0.45 + jit(0.2),
+                    chestPos.getZ() + 0.5 + jit(0.3));
+            dep = Dep.OPEN;
+            depTicks = 0;
+            depWait = 8 + rng.nextInt(10); // look at it for a moment before opening
+            openTries = 0;
+            return;
+        }
+        int slot0 = findHotbarSlot(player, Items.ENDER_CHEST);
+        if (slot0 < 0) {
+            abortDeposit(mc, "lost the ender chest from the hotbar.");
+            return;
+        }
+        if (!spotOk(level, player, chestFloor) || placeTries > 6) {
+            abortDeposit(mc, "couldn't place the ender chest.");
+            return;
+        }
+        mc.options.keyShift.setDown(true); // sneak so the right-click places instead of interacting
+        depSneak = true;
+        if (!ensureSlot(player, slot0 + 1)) return;
+        if (!hitsBlock(mc, chestFloor, Direction.UP)) {
+            rotateToward(player, player.getEyePosition(), chestAim);
+            return;
+        }
+        mc.options.keyUse.setDown(true);
+        useTapPending = true;
+        placeTries++;
+        depWait = 3 + rng.nextInt(3);
+    }
+
+    private void openChest(Minecraft mc, LocalPlayer player, ClientLevel level, Config cfg) {
+        if (!level.getBlockState(chestPos).is(Blocks.ENDER_CHEST)) {
+            abortDeposit(mc, "the ender chest disappeared.");
+            return;
+        }
+        if (depSneak) { // sneaking would block opening it
+            mc.options.keyShift.setDown(false);
+            depSneak = false;
+        }
+        if (!ensureSlot(player, cfg.pickaxeSlot)) return; // hold something that can't place or use
+        if (!hitsBlock(mc, chestPos, null)) {
+            rotateToward(player, player.getEyePosition(), chestOpenAim);
+            return;
+        }
+        if (++openTries > 4) {
+            abortDeposit(mc, "couldn't open the ender chest.");
+            return;
+        }
+        mc.options.keyUse.setDown(true);
+        useTapPending = true;
+        depWait = 10 + rng.nextInt(6); // wait for the screen
+    }
+
+    private void enterTransfer() {
+        dep = Dep.TRANSFER;
+        depTicks = 0;
+        transferWait = 8 + rng.nextInt(10);
+        lastMovedSlot = -1;
+        lastMovedCount = -1;
+        stuckMoves = 0;
+        finishing = false;
+    }
+
+    /** Container screen is open: shift-click one anchor stack at a time with human-ish pauses. */
+    private void tickTransfer(Minecraft mc, Config cfg) {
+        LocalPlayer p = mc.player;
+        if (++depTicks > 1500) {
+            finishTransfer(mc, cfg);
+            return;
+        }
+        if (transferWait > 0) {
+            transferWait--;
+            return;
+        }
+        AbstractContainerMenu menu = p.containerMenu;
+        int found = -1;
+        for (int i = 0; i < menu.slots.size(); i++) {
+            Slot sl = menu.slots.get(i);
+            if (sl.container == p.getInventory() && sl.getItem().is(Items.RESPAWN_ANCHOR)) {
+                found = i;
+                break;
+            }
+        }
+        if (found < 0) {
+            finishTransfer(mc, cfg);
+            return;
+        }
+        int cnt = menu.slots.get(found).getItem().getCount();
+        if (found == lastMovedSlot && cnt == lastMovedCount) {
+            if (++stuckMoves >= 2) { // chest is full
+                finishTransfer(mc, cfg);
+                return;
+            }
+        } else {
+            stuckMoves = 0;
+        }
+        finishing = false;
+        lastMovedSlot = found;
+        lastMovedCount = cnt;
+        mc.gameMode.handleContainerInput(menu.containerId, found, 0, ContainerInput.QUICK_MOVE, p);
+        transferWait = 5 + rng.nextInt(8);
+        if (rng.nextInt(10) == 0) transferWait += 8 + rng.nextInt(18); // the odd longer pause
+    }
+
+    private void finishTransfer(Minecraft mc, Config cfg) {
+        if (!finishing) { // look over the chest for a moment before closing it
+            finishing = true;
+            transferWait = 6 + rng.nextInt(10);
+            return;
+        }
+        Screen screen = mc.gui.screen();
+        if (screen != null) screen.onClose();
+        afterTransfer(mc, cfg);
+    }
+
+    private void afterTransfer(Minecraft mc, Config cfg) {
+        if (cfg.retrieveChest && chestPos != null) {
+            dep = Dep.RETRIEVE;
+            depTicks = 0;
+            depWait = 8 + rng.nextInt(10);
+        } else {
+            endDeposit(mc, 40);
+        }
+    }
+
+    /** Mine the ender chest back (Silk Touch) and let the pickup logic collect it. */
+    private void retrieveChest(Minecraft mc, LocalPlayer player, ClientLevel level, Config cfg) {
+        if (!level.getBlockState(chestPos).is(Blocks.ENDER_CHEST)) { // gone: broken
+            chestPickupUntil = clock + 300;
+            lastBreakTick = clock;
+            itemScanClock = 1000;
+            endDeposit(mc, 60);
+            return;
+        }
+        if (!ensureSlot(player, cfg.pickaxeSlot)) return;
+        breakBlock = chestPos;
+        if (!hitsBlock(mc, chestPos, null)) {
+            wantAttack = false;
+            rotateToward(player, player.getEyePosition(), chestOpenAim);
+            return;
+        }
+        wantAttack = true;
     }
 
     // ---------------------------------------------------------------- helpers
@@ -565,7 +829,8 @@ public final class AnchorController {
     }
 
     private void reset(Minecraft mc) {
-        releaseHop(mc);
+        releaseDepKeys(mc);
+        if (dep != Dep.NONE && dep != Dep.TRANSFER) dep = Dep.NONE;
         releaseAttack(mc);
         stopWalking(mc);
         stopEating(mc);

@@ -19,8 +19,12 @@ public final class Config {
 
     /** Master on/off switch (also toggled by the keybind). */
     public boolean enabled = true;
-    /** Detection radius in blocks (1-32). */
-    public int radius = 4;
+    /** Detection range = your block reach (4.5 survival, 5 creative) minus this margin. */
+    public double reachMargin = 0.3;
+    /** Also mine a snow layer on/next to an anchor when it blocks the view of it. */
+    public boolean clearSnow = true;
+    /** Sprint-jump while Baritone is pathing to the next anchor (only on flat, clear ground). */
+    public boolean autoHop = true;
     /** How often (in ticks) to scan for anchors while no target is selected (1-100). */
     public int scanIntervalTicks = 10;
     /** Switch to the pickaxe hotbar slot before breaking an anchor. */
@@ -76,7 +80,7 @@ public final class Config {
     }
 
     private void sanitize() {
-        radius = Math.max(1, Math.min(32, radius));
+        reachMargin = Math.max(0.0, Math.min(2.0, reachMargin));
         scanIntervalTicks = Math.max(1, Math.min(100, scanIntervalTicks));
         pickaxeSlot = Math.max(1, Math.min(9, pickaxeSlot));
         maxDropBlocks = Math.max(1, Math.min(64, maxDropBlocks));

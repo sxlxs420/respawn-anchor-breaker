@@ -31,6 +31,7 @@ public final class ClickGuiScreen extends Screen {
     private static final int TRACK_OFF = 0xFF3A3A3A;
     private static final int KNOB = 0xFFF2F2F2;
     private static final int BTN = 0xFF2C2C2C;
+    private static final int BTN_HOVER = 0xFF3A3A3A;
 
     private static final int SIDEBAR_W = 104;
     private static final int CARD_H = 34;
@@ -71,13 +72,14 @@ public final class ClickGuiScreen extends Screen {
         super(Component.literal("Respawn Anchor Breaker"));
         Config c = Config.get();
         entries.add(new Entry("Anchors", "Enabled", "Master switch for the mod", () -> c.enabled, v -> c.enabled = v));
-        entries.add(new Entry("Anchors", "Detection Radius", "Blocks to scan for anchors", () -> c.radius, v -> c.radius = v, 1, 32));
+        entries.add(new Entry("Anchors", "Clear Snow", "Mine snow covering an anchor", () -> c.clearSnow, v -> c.clearSnow = v));
         entries.add(new Entry("Tools", "Auto Swap", "Switch to your pickaxe slot", () -> c.autoSwap, v -> c.autoSwap = v));
         entries.add(new Entry("Tools", "Pickaxe Slot", "Hotbar slot of your pickaxe", () -> c.pickaxeSlot, v -> c.pickaxeSlot = v, 1, 9));
         entries.add(new Entry("Tools", "Auto Eat", "Eat after each anchor", () -> c.autoEat, v -> c.autoEat = v));
         entries.add(new Entry("Tools", "Food Slot", "Hotbar slot of your food", () -> c.foodSlot, v -> c.foodSlot = v, 1, 9));
         entries.add(new Entry("Tools", "Eat Count", "Pieces to eat per anchor", () -> c.eatCount, v -> c.eatCount = v, 1, 10));
         entries.add(new Entry("Movement", "Auto Pickup", "Walk to dropped anchors", () -> c.autoPickup, v -> c.autoPickup = v));
+        entries.add(new Entry("Movement", "Sprint Jump", "Hop while Baritone paths", () -> c.autoHop, v -> c.autoHop = v));
         entries.add(new Entry("Movement", "Max Drop", "Biggest fall it will walk off", () -> c.maxDropBlocks, v -> c.maxDropBlocks = v, 1, 64));
         entries.add(new Entry("Baritone", "Baritone Goto", "Sends #goto when none are left", () -> c.baritoneGoto, v -> c.baritoneGoto = v));
 
@@ -143,6 +145,12 @@ public final class ClickGuiScreen extends Screen {
         return s + "..";
     }
 
+    /** Rectangle with the four corner pixels cut off (looks rounded at GUI scale). */
+    private static void box(GuiGraphicsExtractor g, int x, int y, int w, int h, int color) {
+        g.fill(x + 1, y, x + w - 1, y + h, color);
+        g.fill(x, y + 1, x + w, y + h - 1, color);
+    }
+
     private void text(GuiGraphicsExtractor g, String s, int x, int y, int color) {
         g.text(this.font, s, x, y, color, false);
     }
@@ -154,74 +162,91 @@ public final class ClickGuiScreen extends Screen {
         super.extractRenderState(g, mouseX, mouseY, delta);
         layout();
 
-        // frame, panel and sidebar
-        g.fill(px - 1, py - 1, px + pw + 1, py + ph + 1, BORDER);
-        g.fill(px, py, px + pw, py + ph, PANEL);
-        g.fill(px, py, px + SIDEBAR_W, py + ph, SIDEBAR);
+        // frame, panel, sidebar
+        box(g, px - 1, py - 1, pw + 2, ph + 2, BORDER);
+        box(g, px, py, pw, ph, PANEL);
+        g.fill(px, py + 1, px + SIDEBAR_W, py + ph - 1, SIDEBAR);
+        g.fill(px + 1, py, px + SIDEBAR_W, py + ph, SIDEBAR);
         g.fill(px + SIDEBAR_W, py, px + SIDEBAR_W + 1, py + ph, BORDER);
 
-        // sidebar header + categories
+        // sidebar: title, categories with enabled-count, close hint
         text(g, "Anchor Breaker", px + 10, py + 12, ACCENT);
-        text(g, "Categories", px + 10, py + 30, MUTED);
+        text(g, "Modules", px + 10, py + 30, MUTED);
         for (int i = 0; i < categories.size(); i++) {
             String cat = categories.get(i);
             int ry = py + 44 + i * 22;
             boolean sel = cat.equals(selected);
             boolean hover = in(mouseX, mouseY, px + 6, ry, SIDEBAR_W - 12, 20);
             if (sel) {
-                g.fill(px + 6, ry, px + SIDEBAR_W - 6, ry + 20, SELECTED);
-                g.fill(px + 6, ry, px + 8, ry + 20, ACCENT);
+                box(g, px + 6, ry, SIDEBAR_W - 12, 20, SELECTED);
+                g.fill(px + 6, ry + 4, px + 8, ry + 16, ACCENT);
             } else if (hover) {
-                g.fill(px + 6, ry, px + SIDEBAR_W - 6, ry + 20, CARD);
+                box(g, px + 6, ry, SIDEBAR_W - 12, 20, CARD);
             }
             text(g, cat, px + 14, ry + 6, sel ? ACCENT : TEXT);
-            String n = Integer.toString(enabledCount(cat));
-            text(g, n, px + SIDEBAR_W - 12 - this.font.width(n), ry + 6, MUTED);
+            int count = enabledCount(cat);
+            String n = Integer.toString(count);
+            text(g, n, px + SIDEBAR_W - 12 - this.font.width(n), ry + 6, count > 0 ? ACCENT : MUTED);
         }
+        text(g, "RCtrl / Esc", px + 10, py + ph - 24, MUTED);
+        text(g, "to close", px + 10, py + ph - 14, MUTED);
 
-        // content header: category title and All / On pills
-        text(g, selected, contentX() + GAP + 2, py + 14, TEXT);
+        // header: category title, module count, divider, All / On pills
+        List<Entry> list = visible();
+        int hx = contentX() + GAP + 2;
+        text(g, selected, hx, py + 14, TEXT);
+        text(g, list.size() + (list.size() == 1 ? " module" : " modules"),
+                hx + this.font.width(selected) + 8, py + 14, MUTED);
+        g.fill(contentX() + GAP, py + 30, px + pw - GAP, py + 31, BORDER);
+
         int pillOnX = px + pw - GAP - 28;
         int pillAllX = pillOnX - 32;
-        g.fill(pillAllX, py + 9, pillAllX + 30, py + 23, onlyEnabled ? CARD : SELECTED);
-        g.fill(pillOnX, py + 9, pillOnX + 28, py + 23, onlyEnabled ? SELECTED : CARD);
+        box(g, pillAllX, py + 9, 30, 14, onlyEnabled ? CARD : SELECTED);
+        box(g, pillOnX, py + 9, 28, 14, onlyEnabled ? SELECTED : CARD);
         text(g, "All", pillAllX + 9, py + 13, onlyEnabled ? MUTED : ACCENT);
         text(g, "On", pillOnX + 9, py + 13, onlyEnabled ? ACCENT : MUTED);
 
         // cards
-        List<Entry> list = visible();
         int cw = cardW();
+        if (list.isEmpty()) {
+            String msg = "Nothing enabled here";
+            text(g, msg, contentX() + (pw - SIDEBAR_W - this.font.width(msg)) / 2, py + 60, MUTED);
+        }
         for (int i = 0; i < list.size(); i++) {
             Entry e = list.get(i);
             int cx = cardX(i), cy = cardY(i);
-            g.fill(cx, cy, cx + cw, cy + CARD_H, in(mouseX, mouseY, cx, cy, cw, CARD_H) ? CARD_HOVER : CARD);
+            box(g, cx, cy, cw, CARD_H, in(mouseX, mouseY, cx, cy, cw, CARD_H) ? CARD_HOVER : CARD);
 
-            int rightW = e.isToggle() ? 30 : 56;
+            int rightW = e.isToggle() ? 42 : 56;
             int textW = cw - 16 - rightW;
             text(g, fit(e.name, textW), cx + 8, cy + 7, TEXT);
             text(g, fit(e.desc, textW), cx + 8, cy + 20, MUTED);
 
             if (e.isToggle()) {
                 boolean on = e.getB.getAsBoolean();
+                if (on) g.fill(cx, cy + 5, cx + 2, cy + CARD_H - 5, ACCENT);
                 int tx = cx + cw - 8 - 22, ty = cy + 12;
-                g.fill(tx, ty, tx + 22, ty + 10, on ? ACCENT : TRACK_OFF);
+                box(g, tx, ty, 22, 10, on ? ACCENT : TRACK_OFF);
                 int kx = on ? tx + 13 : tx + 1;
-                g.fill(kx, ty + 1, kx + 8, ty + 9, KNOB);
+                box(g, kx, ty + 1, 8, 8, KNOB);
+                // small grip dots left of the switch
+                for (int a2 = 0; a2 < 2; a2++) {
+                    for (int b2 = 0; b2 < 3; b2++) {
+                        g.fill(tx - 11 + a2 * 3, ty - 1 + b2 * 3, tx - 10 + a2 * 3, ty + b2 * 3, MUTED);
+                    }
+                }
             } else {
                 int by = cy + 11;
                 int plusX = cx + cw - 8 - 12;
                 int minusX = plusX - 12 - 26;
-                g.fill(minusX, by, minusX + 12, by + 12, BTN);
-                g.fill(plusX, by, plusX + 12, by + 12, BTN);
+                box(g, minusX, by, 12, 12, in(mouseX, mouseY, minusX, by, 12, 12) ? BTN_HOVER : BTN);
+                box(g, plusX, by, 12, 12, in(mouseX, mouseY, plusX, by, 12, 12) ? BTN_HOVER : BTN);
                 text(g, "-", minusX + 4, by + 2, TEXT);
                 text(g, "+", plusX + 3, by + 2, TEXT);
                 String v = Integer.toString(e.getI.getAsInt());
                 text(g, v, minusX + 12 + (26 - this.font.width(v)) / 2, by + 2, ACCENT);
             }
         }
-
-        text(g, "Right Ctrl / Esc to close", px + pw - GAP - this.font.width("Right Ctrl / Esc to close"),
-                py + ph - 12, MUTED);
     }
 
     // ---------------------------------------------------------------- input

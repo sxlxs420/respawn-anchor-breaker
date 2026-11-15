@@ -39,6 +39,8 @@ public final class AnchorController {
     // anchor-breaking state
     private BlockPos target;
     private Vec3 aimPoint;
+    private BlockPos breakBlock;     // block we may mine right now: the anchor, or snow covering it
+    private static final int PICKUP_RADIUS = 8;
     private int clock;
     private int ticksSinceScan = 1000;
     private int reactionTicks;
@@ -59,6 +61,14 @@ public final class AnchorController {
     private int minedSinceGoto;
     private int lastBreakTick = -1000;
 
+    // sprint-jump state
+    private boolean pathing;          // true after we sent the goto command, until we start working again
+    private int gotoSentTick = -100000;
+    private boolean hopDown;
+    private int hopCooldown;
+    private int hopScan = 1000;
+    private boolean anchorClose;
+
     // pickup state
     private ItemEntity pickup;
     private int itemScanClock = 1000;
@@ -77,6 +87,7 @@ public final class AnchorController {
             releaseAttack(mc);
             stopWalking(mc);
             stopEating(mc);
+            releaseHop(mc);
             return;
         }
         if (target == null) {
@@ -108,6 +119,8 @@ public final class AnchorController {
             reset(mc);
             return;
         }
+        releaseHop(mc); // a hop is a single-tick key tap
+        if (pickup != null || eating || target != null) pathing = false;
         LocalPlayer player = mc.player;
         ClientLevel level = mc.level;
         ignoredUntil.values().removeIf(exp -> exp <= clock);
@@ -120,7 +133,7 @@ public final class AnchorController {
         }
         if (pickup == null && cfg.autoPickup && !wantAttack && !eating && ++itemScanClock >= 5) {
             itemScanClock = 0;
-            ItemEntity found = findDroppedAnchor(level, player, cfg.radius);
+            ItemEntity found = findDroppedAnchor(level, player, PICKUP_RADIUS);
             if (found != null) {
                 clearTarget(mc);
                 stopEating(mc);
@@ -156,19 +169,21 @@ public final class AnchorController {
         if (target == null) {
             if (++ticksSinceScan >= cfg.scanIntervalTicks) {
                 ticksSinceScan = 0;
-                acquire(player, level, cfg.radius);
+                acquire(player, level, player.blockInteractionRange() - cfg.reachMargin);
                 if (target == null) maybeSendGoto(mc, cfg);
             }
             if (target == null) {
                 wantAttack = false;
+                tickHop(mc, player, level, cfg);
                 return;
             }
         }
 
         Vec3 eye = player.getEyePosition();
+        double reach = player.blockInteractionRange();
 
-        if (clock % 10 == 0 && !visible(level, player, eye, aimPoint)) {
-            Vec3 np = findAimPoint(level, player, target);
+        if (clock % 10 == 0 && resolveBreakBlock(level, player, eye, aimPoint, target) == null) {
+            Vec3 np = findAimPoint(level, player, target, reach);
             if (np == null) {
                 ignore(target, 200);
                 clearTarget(mc);
@@ -177,16 +192,18 @@ public final class AnchorController {
             aimPoint = np;
         }
 
+        // the block to mine right now: the anchor itself, or a snow layer covering it
+        breakBlock = resolveBreakBlock(level, player, eye, aimPoint, target);
+        boolean aimed = breakBlock != null && hitsTarget(mc);
+
         if (reactionTicks > 0) {
             reactionTicks--;
-        } else {
+        } else if (!aimed) {
             rotateToward(player, eye, aimPoint);
         }
 
-        double reach = player.blockInteractionRange();
         boolean near = eye.distanceTo(aimPoint) <= reach + 1.0;
         boolean slotReady = !near || !cfg.autoSwap || ensureSlot(player, cfg.pickaxeSlot);
-        boolean aimed = hitsTarget(mc);
         wantAttack = aimed && slotReady;
 
         if (wantAttack) {
@@ -212,7 +229,7 @@ public final class AnchorController {
 
     private boolean pickupStillValid(LocalPlayer player, Config cfg) {
         if (pickup.isRemoved() || !pickup.getItem().is(Items.RESPAWN_ANCHOR)) return false;
-        double max = cfg.radius + 2.0;
+        double max = PICKUP_RADIUS + 2.0;
         return pickup.position().distanceToSqr(player.position()) <= max * max;
     }
 
@@ -431,6 +448,93 @@ public final class AnchorController {
         if (conn == null) return;
         conn.sendChat(cfg.gotoCommand);
         minedSinceGoto = 0;
+        pathing = true;
+        gotoSentTick = clock;
+    }
+
+
+    // ---------------------------------------------------------------- sprint jumping
+
+    private void releaseHop(Minecraft mc) {
+        if (hopDown) {
+            mc.options.keyJump.setDown(false);
+            hopDown = false;
+        }
+    }
+
+    /**
+     * While Baritone is pathing to the next anchor and we have nothing else to do, tap jump whenever it is
+     * clearly safe: sprinting on flat ground with clear space ahead. Anything that looks like a step, gap,
+     * drop, low ceiling, liquid or ladder is left to Baritone (that's its parkour/precise movement).
+     */
+    private void tickHop(Minecraft mc, LocalPlayer player, ClientLevel level, Config cfg) {
+        if (!cfg.autoHop || !pathing) return;
+        if (clock - gotoSentTick > 2400) { // 2 minutes: Baritone is surely done or gave up
+            pathing = false;
+            return;
+        }
+        if (hopCooldown > 0) {
+            hopCooldown--;
+            return;
+        }
+        if (mc.options.keyJump.isDown()) return; // Baritone (or you) is already jumping
+        if (!hopSafe(level, player)) return;
+
+        if (++hopScan >= 5) {
+            hopScan = 0;
+            anchorClose = anchorWithin(level, player.getEyePosition(), 6.0);
+        }
+        if (anchorClose) return; // about to work: don't overshoot
+
+        mc.options.keyJump.setDown(true);
+        hopDown = true;
+        hopCooldown = 2;
+    }
+
+    private boolean hopSafe(ClientLevel level, LocalPlayer player) {
+        if (!player.onGround() || !player.isSprinting()) return false;
+        if (player.isInWater() || player.isInLava() || player.onClimbable() || player.isFallFlying()) return false;
+
+        Vec3 d = player.getDeltaMovement();
+        double hs = Math.hypot(d.x, d.z);
+        if (hs < 0.15) return false; // not really moving
+        double ux = d.x / hs, uz = d.z / hs;
+        Vec3 pos = player.position();
+
+        // 4 blocks of headroom for the jump itself, and for the next 3 blocks ahead:
+        // clear body space, solid flat ground below, no liquids or hazards.
+        for (int i = 0; i <= 3; i++) {
+            BlockPos col = BlockPos.containing(pos.x + ux * i, pos.y, pos.z + uz * i);
+            for (int h = 0; h <= 3; h++) {
+                BlockPos bp = col.above(h);
+                BlockState st = level.getBlockState(bp);
+                if (!st.getCollisionShape(level, bp).isEmpty() || !st.getFluidState().isEmpty() || hazard(st)) {
+                    // the block at our own feet column counts too: standing in something odd -> don't hop
+                    return false;
+                }
+            }
+            if (i == 0) continue;
+            BlockPos below = col.below();
+            BlockState bs = level.getBlockState(below);
+            if (bs.getCollisionShape(level, below).isEmpty() || hazard(bs)) return false; // gap or drop ahead
+        }
+        return true;
+    }
+
+    private boolean anchorWithin(ClientLevel level, Vec3 eye, double r) {
+        BlockPos o = BlockPos.containing(eye);
+        int n = (int) Math.ceil(r);
+        BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
+        for (int dx = -n; dx <= n; dx++) {
+            for (int dy = -n; dy <= n; dy++) {
+                for (int dz = -n; dz <= n; dz++) {
+                    m.set(o.getX() + dx, o.getY() + dy, o.getZ() + dz);
+                    if (level.getBlockState(m).is(Blocks.RESPAWN_ANCHOR)
+                            && eye.distanceToSqr(Vec3.atCenterOf(m)) <= r * r) return true;
+                }
+            }
+        }
+        return false;
     }
 
     // ---------------------------------------------------------------- helpers
@@ -461,11 +565,13 @@ public final class AnchorController {
     }
 
     private void reset(Minecraft mc) {
+        releaseHop(mc);
         releaseAttack(mc);
         stopWalking(mc);
         stopEating(mc);
         target = null;
         aimPoint = null;
+        breakBlock = null;
         pickup = null;
         wantAttack = false;
         swapDelay = -1;
@@ -484,6 +590,7 @@ public final class AnchorController {
         releaseAttack(mc);
         target = null;
         aimPoint = null;
+        breakBlock = null;
         wantAttack = false;
         ticksOnTarget = 0;
         inReachNotAimed = 0;
@@ -496,34 +603,54 @@ public final class AnchorController {
 
     private boolean stillValid(LocalPlayer player, ClientLevel level) {
         if (!level.getBlockState(target).is(Blocks.RESPAWN_ANCHOR)) return false;
-        double max = Config.get().radius + 1.5;
-        return player.getEyePosition().distanceToSqr(Vec3.atCenterOf(target)) <= max * max;
+        return player.getEyePosition().distanceTo(Vec3.atCenterOf(target))
+                <= player.blockInteractionRange() + 1.0;
     }
 
-    /** True only if BOTH our own ray and the game's current hit result point at the target anchor. */
+    /** True only if BOTH our own ray and the game's current hit result point at the block we may mine. */
     private boolean hitsTarget(Minecraft mc) {
         LocalPlayer player = mc.player;
-        if (player == null || target == null) return false;
+        BlockPos want = breakBlock;
+        if (player == null || want == null) return false;
         HitResult own = player.pick(player.blockInteractionRange(), 1.0F, false);
         if (!(own instanceof BlockHitResult ob) || ob.getType() != HitResult.Type.BLOCK
-                || !ob.getBlockPos().equals(target)) return false;
+                || !ob.getBlockPos().equals(want)) return false;
         return mc.hitResult instanceof BlockHitResult mb
                 && mb.getType() == HitResult.Type.BLOCK
-                && mb.getBlockPos().equals(target);
+                && mb.getBlockPos().equals(want);
     }
 
-    private void acquire(LocalPlayer player, ClientLevel level, int radius) {
+    /**
+     * Which block must be mined to get at the anchor from here: the anchor itself, or (if enabled) a snow
+     * layer touching it that is in the way. Returns null if something else blocks the view.
+     */
+    private BlockPos resolveBreakBlock(ClientLevel level, LocalPlayer player, Vec3 eye, Vec3 point, BlockPos anchor) {
+        if (point == null || anchor == null) return null;
+        BlockHitResult hit = level.clip(new ClipContext(
+                eye, point, ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, player));
+        if (hit.getType() != HitResult.Type.BLOCK) return null;
+        BlockPos hp = hit.getBlockPos();
+        if (hp.equals(anchor)) return anchor;
+        if (Config.get().clearSnow && level.getBlockState(hp).is(Blocks.SNOW) && hp.distManhattan(anchor) == 1) {
+            return hp.immutable();
+        }
+        return null;
+    }
+
+    /** Finds the closest anchors within maxDist (measured to the aim point) and targets the nearest usable one. */
+    private void acquire(LocalPlayer player, ClientLevel level, double maxDist) {
         Vec3 eye = player.getEyePosition();
         BlockPos origin = BlockPos.containing(eye);
-        double r2 = (double) radius * radius;
+        int n = (int) Math.ceil(maxDist) + 1;
+        double scanR = maxDist + 0.9;
         List<BlockPos> found = new ArrayList<>();
         BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
-        for (int dx = -radius; dx <= radius; dx++) {
-            for (int dy = -radius; dy <= radius; dy++) {
-                for (int dz = -radius; dz <= radius; dz++) {
+        for (int dx = -n; dx <= n; dx++) {
+            for (int dy = -n; dy <= n; dy++) {
+                for (int dz = -n; dz <= n; dz++) {
                     m.set(origin.getX() + dx, origin.getY() + dy, origin.getZ() + dz);
                     if (!level.getBlockState(m).is(Blocks.RESPAWN_ANCHOR)) continue;
-                    if (eye.distanceToSqr(Vec3.atCenterOf(m)) > r2) continue;
+                    if (eye.distanceToSqr(Vec3.atCenterOf(m)) > scanR * scanR) continue;
                     if (ignoredUntil.containsKey(m)) continue;
                     found.add(m.immutable());
                 }
@@ -532,7 +659,7 @@ public final class AnchorController {
         found.sort((a, b) -> Double.compare(
                 eye.distanceToSqr(Vec3.atCenterOf(a)), eye.distanceToSqr(Vec3.atCenterOf(b))));
         for (BlockPos pos : found) {
-            Vec3 p = findAimPoint(level, player, pos);
+            Vec3 p = findAimPoint(level, player, pos, maxDist);
             if (p != null) {
                 target = pos;
                 aimPoint = p;
@@ -541,11 +668,11 @@ public final class AnchorController {
                 inReachNotAimed = 0;
                 return;
             }
-            ignore(pos, 100);
         }
     }
 
-    private Vec3 findAimPoint(ClientLevel level, LocalPlayer player, BlockPos pos) {
+    /** A point on/in the anchor that is within maxDist of the eyes and not blocked by anything but snow. */
+    private Vec3 findAimPoint(ClientLevel level, LocalPlayer player, BlockPos pos, double maxDist) {
         Vec3 eye = player.getEyePosition();
         double x = pos.getX(), y = pos.getY(), z = pos.getZ();
         double[][] candidates = {
@@ -557,19 +684,10 @@ public final class AnchorController {
         };
         for (double[] c : candidates) {
             Vec3 p = new Vec3(x + c[0], y + c[1], z + c[2]);
-            if (visible(level, player, eye, p)) return p;
+            if (eye.distanceTo(p) > maxDist) continue;
+            if (resolveBreakBlock(level, player, eye, p, pos) != null) return p;
         }
         return null;
-    }
-
-    private boolean visible(ClientLevel level, LocalPlayer player, Vec3 eye, Vec3 point) {
-        if (point == null) return false;
-        BlockHitResult hit = level.clip(new ClipContext(
-                eye, point, ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, player));
-        if (hit.getType() != HitResult.Type.BLOCK) return false;
-        BlockPos hp = hit.getBlockPos();
-        return level.getBlockState(hp).is(Blocks.RESPAWN_ANCHOR)
-                && (target == null || hp.equals(target) || hp.equals(BlockPos.containing(point)));
     }
 
     private void rotateToward(LocalPlayer p, Vec3 eye, Vec3 point) {
@@ -577,6 +695,8 @@ public final class AnchorController {
         double horiz = Math.sqrt(dx * dx + dz * dz);
         float targetYaw = (float) (Mth.atan2(dz, dx) * 180.0 / Math.PI) - 90.0F;
         float targetPitch = (float) (-(Mth.atan2(dy, horiz) * 180.0 / Math.PI));
+        // Straight above/below: yaw is meaningless, so keep it instead of spinning around.
+        if (horiz < 0.1) targetYaw = p.getYRot();
         rotateTo(p, targetYaw, targetPitch);
     }
 

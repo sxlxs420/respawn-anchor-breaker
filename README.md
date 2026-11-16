@@ -1,5 +1,7 @@
 # sxlxs420's VibeCoded Respawn Anchor Breaker (Fabric, Minecraft Java 26.3)
 
+uses temple clients baritone discord.gg/templ
+
 Client-side mod. While enabled it finds the closest respawn anchor within the radius (default 10 or 4 i forgot),
 smoothly turns the camera to it, and holds the normal attack key only while the game's own crosshair
 target is that anchor. When it breaks, it moves on to the next closest one.

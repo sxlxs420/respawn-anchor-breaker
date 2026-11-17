@@ -1,6 +1,7 @@
 package com.respawnanchorbreaker;
 
 import com.mojang.blaze3d.platform.InputConstants;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.input.KeyEvent;
@@ -8,104 +9,29 @@ import net.minecraft.client.input.MouseButtonEvent;
 import net.minecraft.network.chat.Component;
 import net.minecraft.util.Mth;
 
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
+import java.time.Instant;
+import java.time.LocalTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.List;
-import java.util.Map;
-import java.util.function.BooleanSupplier;
-import java.util.function.Consumer;
-import java.util.function.IntConsumer;
-import java.util.function.IntSupplier;
+import java.util.Locale;
 
-/** Dark, card-based settings screen: category sidebar on the left, toggle/stepper cards on the right. */
+/**
+ * Main menu: one glass panel per category listing its modules, plus the activity log. Left-click a module to
+ * toggle it, right-click (or middle-click) to open its settings. Overlays can be dragged anywhere.
+ */
 public final class ClickGuiScreen extends Screen {
-    // palette
-    private static final int BORDER = 0xFF2A2A2A;
-    private static final int PANEL = 0xF2101010;
-    private static final int SIDEBAR = 0xF2141414;
-    private static final int CARD = 0xFF1B1B1B;
-    private static final int CARD_HOVER = 0xFF232323;
-    private static final int TEXT = 0xFFEAEAEA;
-    private static final int MUTED = 0xFF8A8A8A;
-    private static final int ACCENT = 0xFFC8A02A;
-    private static final int SELECTED = 0xFF2A2517;
-    private static final int TRACK_OFF = 0xFF3A3A3A;
-    private static final int KNOB = 0xFFF2F2F2;
-    private static final int BTN = 0xFF2C2C2C;
-    private static final int BTN_HOVER = 0xFF3A3A3A;
+    private static final int RH = 14;
+    private static final DateTimeFormatter CLOCK = DateTimeFormatter.ofPattern("HH:mm:ss", Locale.ROOT);
 
-    private static final int SIDEBAR_W = 104;
-    private static final int CARD_H = 34;
-    private static final int GAP = 8;
-
-    private static final class Entry {
-        final String category, name, desc;
-        final BooleanSupplier getB;
-        final Consumer<Boolean> setB;
-        final IntSupplier getI;
-        final IntConsumer setI;
-        final int min, max, step;
-        final boolean slider;
-
-        Entry(String category, String name, String desc, BooleanSupplier getB, Consumer<Boolean> setB) {
-            this.category = category; this.name = name; this.desc = desc;
-            this.getB = getB; this.setB = setB;
-            this.getI = null; this.setI = null; this.min = 0; this.max = 0; this.step = 1; this.slider = false;
-        }
-
-        Entry(String category, String name, String desc, IntSupplier getI, IntConsumer setI, int min, int max) {
-            this.category = category; this.name = name; this.desc = desc;
-            this.getB = null; this.setB = null;
-            this.getI = getI; this.setI = setI; this.min = min; this.max = max; this.step = 1; this.slider = false;
-        }
-
-        /** Slider: drag or click along the track; snaps to multiples of step. */
-        Entry(String category, String name, String desc, IntSupplier getI, IntConsumer setI, int min, int max, int step) {
-            this.category = category; this.name = name; this.desc = desc;
-            this.getB = null; this.setB = null;
-            this.getI = getI; this.setI = setI; this.min = min; this.max = max; this.step = step; this.slider = true;
-        }
-
-        boolean isToggle() { return getB != null; }
-    }
-
-    private final List<Entry> entries = new ArrayList<>();
-    private final List<String> categories = new ArrayList<>();
-    private String selected;
-    private boolean onlyEnabled;
-    private Entry dragging;
-    private boolean overlayDrag;
-    private double ovOffX, ovOffY;
-    private int dragX, dragW;
-
-    // layout (recomputed every frame)
-    private int px, py, pw, ph;
+    private final long openedAt = System.currentTimeMillis();
+    private Overlays.Id dragging;
+    private double dragOffX, dragOffY;
+    private int logScroll;
+    private int panelW, panelX0, panelY0, logX, logW, logH;
 
     public ClickGuiScreen() {
-        super(Component.literal("Respawn Anchor Breaker"));
-        Config c = Config.get();
-        entries.add(new Entry("Anchors", "Enabled", "Master switch for the mod", () -> c.enabled, v -> c.enabled = v));
-        entries.add(new Entry("Anchors", "Clear Snow", "Mine snow covering an anchor", () -> c.clearSnow, v -> c.clearSnow = v));
-        entries.add(new Entry("Tools", "Auto Swap", "Switch to your pickaxe slot", () -> c.autoSwap, v -> c.autoSwap = v));
-        entries.add(new Entry("Tools", "Pickaxe Slot", "Hotbar slot of your pickaxe", () -> c.pickaxeSlot, v -> c.pickaxeSlot = v, 1, 9));
-        entries.add(new Entry("Tools", "Auto Eat", "Eat after each anchor", () -> c.autoEat, v -> c.autoEat = v));
-        entries.add(new Entry("Tools", "Food Slot", "Hotbar slot of your food", () -> c.foodSlot, v -> c.foodSlot = v, 1, 9));
-        entries.add(new Entry("Tools", "Eat Count", "Pieces to eat per anchor", () -> c.eatCount, v -> c.eatCount = v, 1, 10));
-        entries.add(new Entry("Movement", "Auto Pickup", "Walk to dropped anchors", () -> c.autoPickup, v -> c.autoPickup = v));
-        entries.add(new Entry("Movement", "Max Drop", "Biggest fall it will walk off", () -> c.maxDropBlocks, v -> c.maxDropBlocks = v, 1, 64));
-        entries.add(new Entry("Deposit", "Deposit Anchors", "Store them in an ender chest", () -> c.depositAnchors, v -> c.depositAnchors = v));
-        entries.add(new Entry("Deposit", "Deposit At", "Anchors carried before depositing", () -> c.depositThreshold, v -> c.depositThreshold = v, 32, 640, 32));
-        entries.add(new Entry("Deposit", "Retrieve Chest", "Mine it back (Silk Touch)", () -> c.retrieveChest, v -> c.retrieveChest = v));
-        entries.add(new Entry("Safety", "Health Guard", "Cancel Baritone and eat if low", () -> c.healthGuard, v -> c.healthGuard = v));
-        entries.add(new Entry("Safety", "Low Health (HP)", "2 HP = 1 heart, 5 = 2.5 hearts", () -> c.lowHealthHp, v -> c.lowHealthHp = v, 1, 19));
-        entries.add(new Entry("Safety", "Totem Guard", "Open inventory after a pop", () -> c.totemGuard, v -> c.totemGuard = v));
-        entries.add(new Entry("Display", "Overlay", "Show the draggable credit card", () -> c.showOverlay, v -> c.showOverlay = v));
-        entries.add(new Entry("Baritone", "Baritone Goto", "Sends #goto when none are left", () -> c.baritoneGoto, v -> c.baritoneGoto = v));
-
-        Map<String, Boolean> seen = new LinkedHashMap<>();
-        for (Entry e : entries) seen.put(e.category, true);
-        categories.addAll(seen.keySet());
-        selected = categories.get(0);
+        super(Component.literal("Anchor Addon"));
     }
 
     @Override
@@ -119,59 +45,33 @@ public final class ClickGuiScreen extends Screen {
         super.removed();
     }
 
-    // ---------------------------------------------------------------- layout helpers
+    private float anim() {
+        float t = Math.min(1f, (System.currentTimeMillis() - openedAt) / 200f);
+        return t * t * (3 - 2 * t);
+    }
 
     private void layout() {
-        pw = Math.min(480, this.width - 16);
-        ph = Math.min(270, this.height - 16);
-        px = (this.width - pw) / 2;
-        py = (this.height - ph) / 2;
+        int n = Modules.CATEGORIES.length;
+        logW = Mth.clamp(this.width / 4, 170, 260);
+        int avail = this.width - logW - 48;
+        panelW = Mth.clamp(avail / n - 8, 100, 134);
+        int total = n * (panelW + 8) + logW;
+        panelX0 = Math.max(4, (this.width - total) / 2);
+        panelY0 = 40;
+        logX = panelX0 + n * (panelW + 8);
+        logH = Mth.clamp(this.height - panelY0 - 30, 140, 280);
     }
 
-    private int contentX() { return px + SIDEBAR_W; }
-
-    private int cardW() { return (pw - SIDEBAR_W - GAP * 3) / 2; }
-
-    private List<Entry> visible() {
-        List<Entry> out = new ArrayList<>();
-        for (Entry e : entries) {
-            if (!e.category.equals(selected)) continue;
-            if (onlyEnabled && !(e.isToggle() && e.getB.getAsBoolean())) continue;
-            out.add(e);
-        }
-        return out;
-    }
-
-    private int cardX(int i) { return contentX() + GAP + (i % 2) * (cardW() + GAP); }
-
-    private int cardY(int i) { return py + 40 + (i / 2) * (CARD_H + GAP); }
-
-    private int enabledCount(String category) {
-        int n = 0;
-        for (Entry e : entries) {
-            if (e.category.equals(category) && e.isToggle() && e.getB.getAsBoolean()) n++;
-        }
-        return n;
+    private int panelHeight(String cat) {
+        return 22 + Modules.inCategory(cat).size() * RH + 6;
     }
 
     private static boolean in(double mx, double my, int x, int y, int w, int h) {
         return mx >= x && mx < x + w && my >= y && my < y + h;
     }
 
-    private String fit(String s, int maxW) {
-        if (this.font.width(s) <= maxW) return s;
-        while (s.length() > 1 && this.font.width(s + "..") > maxW) s = s.substring(0, s.length() - 1);
-        return s + "..";
-    }
-
-    /** Rectangle with the four corner pixels cut off (looks rounded at GUI scale). */
-    private static void box(GuiGraphicsExtractor g, int x, int y, int w, int h, int color) {
-        g.fill(x + 1, y, x + w - 1, y + h, color);
-        g.fill(x, y + 1, x + w, y + h - 1, color);
-    }
-
-    private void text(GuiGraphicsExtractor g, String s, int x, int y, int color) {
-        g.text(this.font, s, x, y, color, false);
+    private static String clock(long ms) {
+        return LocalTime.ofInstant(Instant.ofEpochMilli(ms), ZoneId.systemDefault()).format(CLOCK);
     }
 
     // ---------------------------------------------------------------- rendering
@@ -180,207 +80,179 @@ public final class ClickGuiScreen extends Screen {
     public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float delta) {
         super.extractRenderState(g, mouseX, mouseY, delta);
         layout();
+        float a = anim();
 
-        // frame, panel, sidebar
-        box(g, px - 1, py - 1, pw + 2, ph + 2, BORDER);
-        box(g, px, py, pw, ph, PANEL);
-        g.fill(px, py + 1, px + SIDEBAR_W, py + ph - 1, SIDEBAR);
-        g.fill(px + 1, py, px + SIDEBAR_W, py + ph, SIDEBAR);
-        g.fill(px + SIDEBAR_W, py, px + SIDEBAR_W + 1, py + ph, BORDER);
+        String title = "ANCHOR ADDON";
+        Gfx.text(g, this.font, title, (this.width - this.font.width(title)) / 2, 11, Gfx.mulA(Gfx.GOLD, a));
+        String sub = "Left-click: toggle    Right-click: module settings    Drag overlays to move them";
+        Gfx.text(g, this.font, sub, (this.width - this.font.width(sub)) / 2, 23, Gfx.mulA(Gfx.MUTED, a));
 
-        // sidebar: title, categories with enabled-count, close hint
-        text(g, "Anchor Breaker", px + 10, py + 12, ACCENT);
-        text(g, "Modules", px + 10, py + 30, MUTED);
-        for (int i = 0; i < categories.size(); i++) {
-            String cat = categories.get(i);
-            int ry = py + 44 + i * 22;
-            boolean sel = cat.equals(selected);
-            boolean hover = in(mouseX, mouseY, px + 6, ry, SIDEBAR_W - 12, 20);
-            if (sel) {
-                box(g, px + 6, ry, SIDEBAR_W - 12, 20, SELECTED);
-                g.fill(px + 6, ry + 4, px + 8, ry + 16, ACCENT);
-            } else if (hover) {
-                box(g, px + 6, ry, SIDEBAR_W - 12, 20, CARD);
-            }
-            text(g, cat, px + 14, ry + 6, sel ? ACCENT : TEXT);
-            int count = enabledCount(cat);
-            String n = Integer.toString(count);
-            text(g, n, px + SIDEBAR_W - 12 - this.font.width(n), ry + 6, count > 0 ? ACCENT : MUTED);
-        }
-        text(g, "RCtrl / Esc", px + 10, py + ph - 24, MUTED);
-        text(g, "to close", px + 10, py + ph - 14, MUTED);
+        Module hovered = null;
+        for (int ci = 0; ci < Modules.CATEGORIES.length; ci++) {
+            String cat = Modules.CATEGORIES[ci];
+            List<Module> mods = Modules.inCategory(cat);
+            int px = panelX0 + ci * (panelW + 8);
+            int ph = panelHeight(cat);
+            Gfx.glass(g, px, panelY0, panelW, ph, a);
+            g.fill(px + 2, panelY0, px + panelW - 2, panelY0 + 1, Gfx.mulA(Gfx.GOLD, a));
+            Gfx.text(g, this.font, cat, px + 8, panelY0 + 7, Gfx.mulA(Gfx.GOLD, a));
+            int on = 0;
+            for (Module m : mods) if (m.enabled()) on++;
+            String cnt = on + "/" + mods.size();
+            Gfx.text(g, this.font, cnt, px + panelW - 8 - this.font.width(cnt), panelY0 + 7, Gfx.mulA(Gfx.MUTED, a));
+            g.fill(px + 6, panelY0 + 18, px + panelW - 6, panelY0 + 19, Gfx.mulA(Gfx.GOLD, 0.25f * a));
 
-        // header: category title, module count, divider, All / On pills
-        List<Entry> list = visible();
-        int hx = contentX() + GAP + 2;
-        text(g, selected, hx, py + 14, TEXT);
-        text(g, list.size() + (list.size() == 1 ? " module" : " modules"),
-                hx + this.font.width(selected) + 8, py + 14, MUTED);
-        g.fill(contentX() + GAP, py + 30, px + pw - GAP, py + 31, BORDER);
-
-        int pillOnX = px + pw - GAP - 28;
-        int pillAllX = pillOnX - 32;
-        box(g, pillAllX, py + 9, 30, 14, onlyEnabled ? CARD : SELECTED);
-        box(g, pillOnX, py + 9, 28, 14, onlyEnabled ? SELECTED : CARD);
-        text(g, "All", pillAllX + 9, py + 13, onlyEnabled ? MUTED : ACCENT);
-        text(g, "On", pillOnX + 9, py + 13, onlyEnabled ? ACCENT : MUTED);
-
-        // cards
-        int cw = cardW();
-        if (list.isEmpty()) {
-            String msg = "Nothing enabled here";
-            text(g, msg, contentX() + (pw - SIDEBAR_W - this.font.width(msg)) / 2, py + 60, MUTED);
-        }
-        for (int i = 0; i < list.size(); i++) {
-            Entry e = list.get(i);
-            int cx = cardX(i), cy = cardY(i);
-            box(g, cx, cy, cw, CARD_H, in(mouseX, mouseY, cx, cy, cw, CARD_H) ? CARD_HOVER : CARD);
-
-            if (e.slider) {
-                int v = e.getI.getAsInt();
-                String vs = v + " (" + stackLabel(v) + ")";
-                text(g, e.name, cx + 8, cy + 6, TEXT);
-                text(g, vs, cx + cw - 8 - this.font.width(vs), cy + 6, ACCENT);
-                int tx = cx + 8, tw = cw - 16, ty = cy + 22;
-                box(g, tx, ty, tw, 4, TRACK_OFF);
-                int fw = (int) ((long) (v - e.min) * tw / Math.max(1, e.max - e.min));
-                if (fw > 0) box(g, tx, ty, Math.max(2, fw), 4, ACCENT);
-                box(g, tx + fw - 3, ty - 3, 6, 10, KNOB);
-                continue;
-            }
-
-            int rightW = e.isToggle() ? 42 : 56;
-            int textW = cw - 16 - rightW;
-            text(g, fit(e.name, textW), cx + 8, cy + 7, TEXT);
-            text(g, fit(e.desc, textW), cx + 8, cy + 20, MUTED);
-
-            if (e.isToggle()) {
-                boolean on = e.getB.getAsBoolean();
-                if (on) g.fill(cx, cy + 5, cx + 2, cy + CARD_H - 5, ACCENT);
-                int tx = cx + cw - 8 - 22, ty = cy + 12;
-                box(g, tx, ty, 22, 10, on ? ACCENT : TRACK_OFF);
-                int kx = on ? tx + 13 : tx + 1;
-                box(g, kx, ty + 1, 8, 8, KNOB);
-                // small grip dots left of the switch
-                for (int a2 = 0; a2 < 2; a2++) {
-                    for (int b2 = 0; b2 < 3; b2++) {
-                        g.fill(tx - 11 + a2 * 3, ty - 1 + b2 * 3, tx - 10 + a2 * 3, ty + b2 * 3, MUTED);
-                    }
+            for (int i = 0; i < mods.size(); i++) {
+                Module m = mods.get(i);
+                int ry = panelY0 + 22 + i * RH;
+                boolean hover = in(mouseX, mouseY, px + 4, ry, panelW - 8, RH - 1) && dragging == null;
+                if (hover) hovered = m;
+                if (m.enabled()) {
+                    Gfx.box(g, px + 4, ry, panelW - 8, RH - 1, Gfx.mulA(0x55E8B923, a));
+                    g.fill(px + 4, ry + 2, px + 6, ry + RH - 3, Gfx.mulA(Gfx.GOLD, a));
+                } else if (hover) {
+                    Gfx.box(g, px + 4, ry, panelW - 8, RH - 1, Gfx.mulA(0x22FFFFFF, a));
                 }
-            } else {
-                int by = cy + 11;
-                int plusX = cx + cw - 8 - 12;
-                int minusX = plusX - 12 - 26;
-                box(g, minusX, by, 12, 12, in(mouseX, mouseY, minusX, by, 12, 12) ? BTN_HOVER : BTN);
-                box(g, plusX, by, 12, 12, in(mouseX, mouseY, plusX, by, 12, 12) ? BTN_HOVER : BTN);
-                text(g, "-", minusX + 4, by + 2, TEXT);
-                text(g, "+", plusX + 3, by + 2, TEXT);
-                String v = Integer.toString(e.getI.getAsInt());
-                text(g, v, minusX + 12 + (26 - this.font.width(v)) / 2, by + 2, ACCENT);
+                String keyTag = (m.key != null && !m.key.isUnbound()) ? "[" + shortKey(m.keyLabel()) + "]" : "";
+                int nameW = panelW - 20 - (keyTag.isEmpty() ? 0 : this.font.width(keyTag) + 4);
+                Gfx.text(g, this.font, Gfx.fit(this.font, m.name, nameW), px + 10, ry + 3,
+                        Gfx.mulA(m.enabled() ? Gfx.TEXT : Gfx.MUTED, a));
+                if (!keyTag.isEmpty()) {
+                    Gfx.text(g, this.font, keyTag, px + panelW - 8 - this.font.width(keyTag), ry + 3, Gfx.mulA(Gfx.GOLD_DIM, a));
+                }
             }
         }
 
-        Overlay.draw(g); // drag it by its body
+        drawLog(g, mouseX, mouseY, a);
+        Overlays.drawAll(g);
+
+        if (hovered != null) {
+            String tip = hovered.name + ": " + hovered.desc;
+            int tw = Math.min(this.width - 16, this.font.width(tip) + 14);
+            int tx = (this.width - tw) / 2;
+            int ty = this.height - 24;
+            Gfx.glass(g, tx, ty, tw, 16, 1f);
+            Gfx.text(g, this.font, Gfx.fit(this.font, tip, tw - 14), tx + 7, ty + 4, Gfx.TEXT);
+        } else {
+            String hint = "Right Ctrl or Esc to close";
+            Gfx.text(g, this.font, hint, (this.width - this.font.width(hint)) / 2, this.height - 16, Gfx.mulA(Gfx.MUTED, a));
+        }
+    }
+
+    private static String shortKey(String s) {
+        return s.length() > 6 ? s.substring(0, 6) : s;
+    }
+
+    private void drawLog(GuiGraphicsExtractor g, int mouseX, int mouseY, float a) {
+        Gfx.glass(g, logX, panelY0, logW, logH, a);
+        g.fill(logX + 2, panelY0, logX + logW - 2, panelY0 + 1, Gfx.mulA(Gfx.GOLD, a));
+        Gfx.text(g, this.font, "Activity Log", logX + 8, panelY0 + 7, Gfx.mulA(Gfx.GOLD, a));
+        int cw = this.font.width("Clear") + 10;
+        int cx = logX + logW - 6 - cw;
+        boolean hov = in(mouseX, mouseY, cx, panelY0 + 4, cw, 12);
+        Gfx.box(g, cx, panelY0 + 4, cw, 12, Gfx.mulA(hov ? 0x66E8B923 : 0x33E8B923, a));
+        Gfx.text(g, this.font, "Clear", cx + 5, panelY0 + 7, Gfx.mulA(Gfx.TEXT, a));
+        g.fill(logX + 6, panelY0 + 18, logX + logW - 6, panelY0 + 19, Gfx.mulA(Gfx.GOLD, 0.25f * a));
+
+        List<ActivityLog.Entry> all = ActivityLog.snapshot();
+        int rows = (logH - 26) / 10;
+        int max = Math.max(0, all.size() - rows);
+        logScroll = Mth.clamp(logScroll, 0, max);
+        int end = all.size() - logScroll;
+        int start = Math.max(0, end - rows);
+        if (all.isEmpty()) {
+            Gfx.text(g, this.font, "Nothing logged yet.", logX + 8, panelY0 + 24, Gfx.mulA(Gfx.MUTED, a));
+        }
+        int y = panelY0 + 23;
+        for (int i = start; i < end; i++) {
+            ActivityLog.Entry e = all.get(i);
+            int cc = e.level == ActivityLog.Level.INFO ? Gfx.GOLD_DIM : e.level == ActivityLog.Level.WARN ? Gfx.YELLOW : Gfx.RED;
+            String t = clock(e.time) + " ";
+            String cat = "[" + e.category + "] ";
+            int x = logX + 8;
+            Gfx.text(g, this.font, t, x, y, Gfx.mulA(Gfx.MUTED, a));
+            x += this.font.width(t);
+            Gfx.text(g, this.font, cat, x, y, Gfx.mulA(cc, a));
+            x += this.font.width(cat);
+            Gfx.text(g, this.font, Gfx.fit(this.font, e.text(), logX + logW - 6 - x), x, y, Gfx.mulA(Gfx.TEXT, a));
+            y += 10;
+        }
+        if (logScroll > 0) {
+            Gfx.text(g, this.font, "scrolled up " + logScroll + " (wheel)", logX + 8, panelY0 + logH - 11, Gfx.mulA(Gfx.MUTED, a));
+        }
     }
 
     // ---------------------------------------------------------------- input
 
     @Override
     public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
-        // Minecraft 26.3 uses SDL mouse buttons: left = 1 (older GLFW numbering used 0).
+        // Minecraft 26.3 uses SDL mouse buttons: left = 1, middle = 2, right = 3 (older GLFW numbering: left = 0).
         int btn = event.button();
-        if (btn != 0 && btn != 1) return super.mouseClicked(event, doubleClick);
+        boolean left = btn == 0 || btn == 1;
+        boolean opensSettings = btn == 2 || btn == 3;
         double mx = event.x(), my = event.y();
         layout();
 
-        // the credit card overlay is draggable and sits on top of the menu
-        if (Overlay.hit(mx, my)) {
-            net.minecraft.client.Minecraft mcInst = net.minecraft.client.Minecraft.getInstance();
-            overlayDrag = true;
-            ovOffX = mx - Overlay.x(mcInst);
-            ovOffY = my - Overlay.y(mcInst);
-            return true;
-        }
-
-        // categories
-        for (int i = 0; i < categories.size(); i++) {
-            int ry = py + 44 + i * 22;
-            if (in(mx, my, px + 6, ry, SIDEBAR_W - 12, 20)) {
-                selected = categories.get(i);
+        if (left) {
+            Overlays.Id id = Overlays.hit(mx, my);
+            if (id != null) {
+                int[] r = Overlays.rect(id, Minecraft.getInstance());
+                dragging = id;
+                dragOffX = mx - r[0];
+                dragOffY = my - r[1];
                 return true;
             }
         }
 
-        // All / On pills
-        int pillOnX = px + pw - GAP - 28;
-        int pillAllX = pillOnX - 32;
-        if (in(mx, my, pillAllX, py + 9, 30, 14)) { onlyEnabled = false; return true; }
-        if (in(mx, my, pillOnX, py + 9, 28, 14)) { onlyEnabled = true; return true; }
-
-        // cards
-        List<Entry> list = visible();
-        int cw = cardW();
-        for (int i = 0; i < list.size(); i++) {
-            Entry e = list.get(i);
-            int cx = cardX(i), cy = cardY(i);
-            if (!in(mx, my, cx, cy, cw, CARD_H)) continue;
-            if (e.slider) {
-                dragging = e;
-                dragX = cx + 8;
-                dragW = cw - 16;
-                setSlider(e, mx);
+        for (int ci = 0; ci < Modules.CATEGORIES.length; ci++) {
+            List<Module> mods = Modules.inCategory(Modules.CATEGORIES[ci]);
+            int px = panelX0 + ci * (panelW + 8);
+            for (int i = 0; i < mods.size(); i++) {
+                int ry = panelY0 + 22 + i * RH;
+                if (!in(mx, my, px + 4, ry, panelW - 8, RH - 1)) continue;
+                Module m = mods.get(i);
+                if (left) {
+                    m.toggle();
+                    Config.save();
+                    ActivityLog.info("Module", m.name + (m.enabled() ? " enabled." : " disabled."));
+                } else if (opensSettings) {
+                    Minecraft.getInstance().gui.setScreen(new ModuleScreen(this, m));
+                }
                 return true;
             }
-            if (e.isToggle()) {
-                e.setB.accept(!e.getB.getAsBoolean());
-            } else {
-                int by = cy + 11;
-                int plusX = cx + cw - 8 - 12;
-                int minusX = plusX - 12 - 26;
-                int v = e.getI.getAsInt();
-                if (in(mx, my, minusX, by, 12, 12)) e.setI.accept(Math.max(e.min, v - 1));
-                else if (in(mx, my, plusX, by, 12, 12)) e.setI.accept(Math.min(e.max, v + 1));
-            }
+        }
+
+        int cw = this.font.width("Clear") + 10;
+        if (left && in(mx, my, logX + logW - 6 - cw, panelY0 + 4, cw, 12)) {
+            ActivityLog.clear();
+            logScroll = 0;
             return true;
         }
         return super.mouseClicked(event, doubleClick);
     }
 
-    /** 32 -> "half a stack", 64 -> "1 stack", 96 -> "1.5 stacks" (anchors stack to 64). */
-    private static String stackLabel(int count) {
-        if (count == 32) return "half a stack";
-        double stacks = count / 64.0;
-        String n = (count % 64 == 0) ? Integer.toString(count / 64) : Double.toString(stacks);
-        return n + (count == 64 ? " stack" : " stacks");
-    }
-
-    private void setSlider(Entry e, double mx) {
-        double t = Mth.clamp((mx - dragX) / Math.max(1, dragW), 0.0, 1.0);
-        double raw = e.min + t * (e.max - e.min);
-        int snapped = e.min + (int) Math.round((raw - e.min) / e.step) * e.step;
-        e.setI.accept(Mth.clamp(snapped, e.min, e.max));
-    }
-
-    // Not annotated with @Override on purpose: if a signature differs in this version the slider
-    // still works by clicking; with the right signature, dragging works too.
+    // Not annotated with @Override on purpose: if a signature differs in some version the menu still works
+    // (clicking), and with the right signature dragging and scrolling work too.
     public boolean mouseDragged(MouseButtonEvent event, double dragXd, double dragYd) {
-        if (overlayDrag) {
-            Config c = Config.get();
-            c.overlayX = (int) (event.x() - ovOffX);
-            c.overlayY = (int) (event.y() - ovOffY);
-            return true;
-        }
         if (dragging == null) return false;
-        setSlider(dragging, event.x());
+        Overlays.move(dragging, (int) (event.x() - dragOffX), (int) (event.y() - dragOffY));
         return true;
     }
 
     public boolean mouseReleased(MouseButtonEvent event) {
-        if (overlayDrag) {
-            overlayDrag = false;
+        if (dragging != null) {
+            dragging = null;
             Config.save();
         }
-        dragging = null;
+        return false;
+    }
+
+    public boolean mouseScrolled(double mx, double my, double scrollX, double scrollY) {
+        if (in(mx, my, logX, panelY0, logW, logH)) {
+            logScroll += scrollY > 0 ? 3 : -3;
+            logScroll = Math.max(0, logScroll);
+            return true;
+        }
         return false;
     }
 

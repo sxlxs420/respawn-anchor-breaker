@@ -3,7 +3,7 @@
   "id": "respawn_anchor_breaker",
   "version": "${version}",
   "name": "Respawn Anchor Breaker",
-  "description": "Anchor addon for Temple Client + Baritone: breaks nearby respawn anchors, eats, deposits and stays safe. By sxlxs420.",
+  "description": "Anchor addon for Temple Client + Baritone: mines respawn anchors, eats, deposits, RTPs and stays safe. By sxlxs420. discord.gg/templ",
   "authors": ["sxlxs420"],
   "license": "MIT",
   "environment": "client",

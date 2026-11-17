@@ -1,4 +1,26 @@
 {
   "key.respawn_anchor_breaker.toggle": "Toggle Respawn Anchor Breaker",
-  "key.respawn_anchor_breaker.gui": "Open Respawn Anchor Breaker menu"
+  "key.respawn_anchor_breaker.gui": "Open Anchor Addon menu",
+  "key.respawn_anchor_breaker.module.anchor_mining": "Toggle Anchor Mining",
+  "key.respawn_anchor_breaker.module.cluster_mining": "Toggle Cluster Mining",
+  "key.respawn_anchor_breaker.module.auto_swap": "Toggle Pickaxe Swap",
+  "key.respawn_anchor_breaker.module.clear_snow": "Toggle Clear Snow",
+  "key.respawn_anchor_breaker.module.auto_pickup": "Toggle Auto Pickup",
+  "key.respawn_anchor_breaker.module.water_mining": "Toggle Water Mining",
+  "key.respawn_anchor_breaker.module.item_assist": "Toggle Unreachable Drops",
+  "key.respawn_anchor_breaker.module.food": "Toggle Food",
+  "key.respawn_anchor_breaker.module.cobble_refill": "Toggle Cobble Refill",
+  "key.respawn_anchor_breaker.module.deposit": "Toggle Deposit Anchors",
+  "key.respawn_anchor_breaker.module.health_guard": "Toggle Health Guard",
+  "key.respawn_anchor_breaker.module.totem_guard": "Toggle Totem Guard",
+  "key.respawn_anchor_breaker.module.baritone": "Toggle Baritone Goto",
+  "key.respawn_anchor_breaker.module.stuck_recovery": "Toggle Stuck Recovery",
+  "key.respawn_anchor_breaker.module.auto_rtp": "Toggle Auto RTP",
+  "key.respawn_anchor_breaker.module.flood_avoider": "Toggle Flood Avoider",
+  "key.respawn_anchor_breaker.module.trident": "Toggle Rain Trident",
+  "key.respawn_anchor_breaker.module.credit_overlay": "Toggle Credit Card",
+  "key.respawn_anchor_breaker.module.market_overlay": "Toggle Market",
+  "key.respawn_anchor_breaker.module.stats_overlay": "Toggle Farm Stats",
+  "key.respawn_anchor_breaker.module.keys_overlay": "Toggle Keybinds List",
+  "key.respawn_anchor_breaker.module.log_overlay": "Toggle Log Overlay"
 }

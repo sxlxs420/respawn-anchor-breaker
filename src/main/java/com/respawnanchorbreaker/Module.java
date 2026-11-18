@@ -108,8 +108,14 @@ public final class Module {
         return this;
     }
 
+    /** True only for a real key (an old bad "-1" key from a previous build counts as unbound). */
+    public boolean bound() {
+        if (key == null || key.isUnbound()) return false;
+        String l = key.getTranslatedKeyMessage().getString();
+        return !l.contains("-1") && !l.toLowerCase(java.util.Locale.ROOT).contains("unknown");
+    }
+
     public String keyLabel() {
-        if (key == null || key.isUnbound()) return "None";
-        return key.getTranslatedKeyMessage().getString();
+        return bound() ? key.getTranslatedKeyMessage().getString() : "None";
     }
 }

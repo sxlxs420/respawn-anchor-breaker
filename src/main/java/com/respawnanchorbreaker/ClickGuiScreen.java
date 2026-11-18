@@ -113,7 +113,7 @@ public final class ClickGuiScreen extends Screen {
                 } else if (hover) {
                     Gfx.box(g, px + 4, ry, panelW - 8, RH - 1, Gfx.mulA(0x22FFFFFF, a));
                 }
-                String keyTag = (m.key != null && !m.key.isUnbound()) ? "[" + shortKey(m.keyLabel()) + "]" : "";
+                String keyTag = m.bound() ? "[" + shortKey(m.keyLabel()) + "]" : "";
                 int nameW = panelW - 20 - (keyTag.isEmpty() ? 0 : this.font.width(keyTag) + 4);
                 Gfx.text(g, this.font, Gfx.fit(this.font, m.name, nameW), px + 10, ry + 3,
                         Gfx.mulA(m.enabled() ? Gfx.TEXT : Gfx.MUTED, a));

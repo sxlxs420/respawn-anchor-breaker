@@ -187,12 +187,38 @@ public final class Modules {
             m.key = KeyMappingHelper.registerKeyMapping(new KeyMapping(
                     "key.respawn_anchor_breaker.module." + m.id,
                     InputConstants.Type.KEYBOARD,
-                    -1,
+                    InputConstants.UNKNOWN.getValue(),
                     KeyMapping.Category.MISC));
         }
     }
 
+    private static boolean sanitized;
+
+    /**
+     * An earlier build registered the module keys with a raw "-1" key code. Minecraft saved that into options.txt,
+     * and a -1 key reads outside the keyboard-state array (crash when joining a server, mouse not captured after
+     * closing a menu). Reset any such key to "unbound" once at startup and save the clean options.
+     */
+    private static void sanitizeKeys(Minecraft mc) {
+        sanitized = true;
+        boolean fixed = false;
+        for (Module m : ALL) {
+            if (m.key == null) continue;
+            String l = m.key.getTranslatedKeyMessage().getString();
+            if (l.contains("-1") || (!m.key.isUnbound() && l.toLowerCase(java.util.Locale.ROOT).contains("unknown"))) {
+                m.key.setKey(InputConstants.UNKNOWN);
+                fixed = true;
+            }
+        }
+        if (fixed) {
+            KeyMapping.resetMapping();
+            mc.options.save();
+            ActivityLog.info("System", "Reset invalid module keybinds left by an older build.");
+        }
+    }
+
     public static void tickKeys(Minecraft mc) {
+        if (!sanitized) sanitizeKeys(mc);
         if (mc.player == null) return;
         for (Module m : ALL) {
             if (m.key == null) continue;
@@ -205,7 +231,7 @@ public final class Modules {
     }
 
     public static boolean anyBound() {
-        for (Module m : ALL) if (m.key != null && !m.key.isUnbound()) return true;
+        for (Module m : ALL) if (m.bound()) return true;
         return false;
     }
 }

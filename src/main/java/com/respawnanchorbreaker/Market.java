@@ -95,31 +95,62 @@ public final class Market {
     private static void fetch(Config cfg, long now) {
         inFlight = true;
         long refresh = cfg.marketRefreshSeconds * 1000L;
+        List<String> urls = new ArrayList<>();
+        urls.add(cfg.marketUrl);
+        for (String u : new String[]{"https://api.donut.auction/v2/tickers/",
+                "https://api.donut.auction/v2/items/search?q=respawn%20anchor"}) {
+            if (!urls.contains(u)) urls.add(u);
+        }
+        attempt(urls, 0, cfg.marketQuery, refresh, new StringBuilder());
+    }
+
+    /** Tries each endpoint in turn until one gives a usable price. Everything runs off the game thread. */
+    private static void attempt(List<String> urls, int idx, String query, long refresh, StringBuilder why) {
         try {
-            HttpRequest req = HttpRequest.newBuilder(URI.create(cfg.marketUrl))
+            HttpRequest req = HttpRequest.newBuilder(URI.create(urls.get(idx)))
                     .timeout(Duration.ofSeconds(10))
                     .header("User-Agent", "RespawnAnchorBreaker/1.0 (client mod; prices via donut.auction)")
                     .header("Accept", "application/json")
                     .GET().build();
-            String query = cfg.marketQuery;
             HTTP.sendAsync(req, HttpResponse.BodyHandlers.ofString()).whenComplete((resp, err) -> {
+                String problem;
                 try {
                     if (err != null) {
-                        fail("connection problem (" + root(err) + ")", refresh);
+                        problem = "connection problem (" + root(err) + ")";
                     } else if (resp.statusCode() != 200) {
-                        fail("HTTP " + resp.statusCode(), refresh);
+                        problem = "HTTP " + resp.statusCode();
                     } else {
-                        parse(resp.body(), query, refresh);
+                        problem = parse(resp.body(), query, refresh);
+                        if (problem != null) {
+                            String body = resp.body();
+                            String excerpt = body.length() > 220 ? body.substring(0, 220) + "..." : body;
+                            ActivityLog.warnEvery("market-body-" + idx, 300_000, "Market",
+                                    "Unrecognised response from " + urls.get(idx) + " : " + excerpt.replace('\n', ' '));
+                        }
                     }
                 } catch (Exception e) {
-                    fail("unreadable response (" + e.getClass().getSimpleName() + ")", refresh);
-                } finally {
+                    problem = "unreadable response (" + e.getClass().getSimpleName() + ")";
+                }
+                if (problem == null) {
+                    inFlight = false;
+                    return;
+                }
+                if (why.length() > 0) why.append("; ");
+                why.append(urls.get(idx).replace("https://api.donut.auction", "")).append(": ").append(problem);
+                if (idx + 1 < urls.size()) {
+                    attempt(urls, idx + 1, query, refresh, why);
+                } else {
+                    fail(why.toString(), refresh);
                     inFlight = false;
                 }
             });
         } catch (Exception e) { // bad URL etc.
-            fail("bad request (" + e.getClass().getSimpleName() + ")", refresh);
-            inFlight = false;
+            if (idx + 1 < urls.size()) {
+                attempt(urls, idx + 1, query, refresh, why);
+            } else {
+                fail("bad request (" + e.getClass().getSimpleName() + ")", refresh);
+                inFlight = false;
+            }
         }
     }
 
@@ -143,19 +174,14 @@ public final class Market {
 
     // ------------------------------------------------------------ parsing (defensive: schema is undocumented)
 
-    private static void parse(String body, String query, long refreshMs) {
+    /** Returns null on success (and stores the result), otherwise a short reason. */
+    private static String parse(String body, String query, long refreshMs) {
         JsonElement root = JsonParser.parseString(body);
         JsonObject item = findItem(root, query);
-        if (item == null) {
-            fail("no \"" + query + "\" entry in the response", refreshMs);
-            return;
-        }
+        if (item == null) return "no \"" + query + "\" entry";
         String[] found = new String[1];
         Double price = pick(item, PRICE_KEYS, found);
-        if (price == null || price <= 0) {
-            fail("item found but no price field (keys: " + keys(item) + ")", refreshMs);
-            return;
-        }
+        if (price == null || price <= 0) return "entry has no price field (keys: " + keys(item) + ")";
         Double volume = pick(item, VOLUME_KEYS, null);
         Double sales = pick(item, SALES_KEYS, null);
         long now = System.currentTimeMillis();
@@ -167,6 +193,7 @@ public final class Market {
         addSample(now / 1000.0, price);
         if (recovered) ActivityLog.info("Market", "Market data connection restored.");
         ActivityLog.infoEvery("market-ok", 300_000, "Market", "Anchor pricing data updated.");
+        return null;
     }
 
     private static String norm(String s) {

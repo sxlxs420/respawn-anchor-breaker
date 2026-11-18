@@ -213,7 +213,7 @@ public final class Overlays {
         Panel p = new Panel();
         p.title = "Keybinds";
         for (Module m : Modules.ALL) {
-            if (m.key == null || m.key.isUnbound()) continue;
+            if (!m.bound()) continue;
             p.lines.add(new Line().add(m.name + "  ", m.enabled() ? Gfx.TEXT : Gfx.MUTED).add(m.keyLabel(), Gfx.GOLD));
         }
         return p;

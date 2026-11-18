@@ -128,6 +128,13 @@ JDK 25, `gradle wrapper --gradle-version 9.6.0` once, then `./gradlew build` (Wi
 Jar: `build/libs/respawn-anchor-breaker-2.0.0.jar`. Or push the folder to GitHub: the included workflow builds it and uploads the jar
 (Actions tab > latest run > Artifacts).
 
+## If a server join crashes or the mouse isn't captured
+Version 2.0.0 had a bug: it registered its module keybinds with a raw `-1` key, which Minecraft 26.3 saved into `options.txt`
+and then read out of range (crash with `IndexOutOfBoundsException` on joining a server, odd "network protocol error", and the mouse not
+being captured after closing a menu). This build registers them as properly unbound and resets any bad saved value at startup.
+If you still crash on launch, close the game, open `.minecraft/options.txt` and delete every line that contains
+`respawn_anchor_breaker.module`.
+
 ## Known limits
 * It was written without being able to run Minecraft: the first run in-game is the real test. Report what the log says.
 * No pathfinding of its own on land: it walks straight at drops and asks Baritone for anything harder.

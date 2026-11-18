@@ -166,6 +166,17 @@ public final class AnchorController {
     private int farPasses;
     private int passFound;
     private int farBudget = 120000;
+    private int nextFarPass;
+    private static java.lang.reflect.Method getSectionsM;
+    private static java.lang.reflect.Method maybeHasM;
+    private static boolean sectionApiBroken;
+    private static final java.util.function.Predicate<BlockState> ANCHOR_PRED = st -> st.is(Blocks.RESPAWN_ANCHOR);
+    private float expYaw;
+    private float expPitch;
+    private boolean rotInit;
+    private int userLookUntil;
+    private int ungrabTicks;
+    private boolean regrabBroken;
     private int noAnchorSince = -1;
     private int profitSince = -1;
 
@@ -276,6 +287,16 @@ public final class AnchorController {
             useTapPending = false;
         }
         if (mc.player != null && mc.level != null) ChatWatcher.poll(mc, this::onChatLine);
+        if (rotInit && mc.player != null) { // did something other than us turn the camera since our last rotation?
+            float dy = Mth.wrapDegrees(mc.player.getYRot() - expYaw);
+            float dp = mc.player.getXRot() - expPitch;
+            if (Math.abs(dy) > 0.6F || Math.abs(dp) > 0.6F) {
+                userLookUntil = clock + 40;
+                ActivityLog.infoEvery("user-look", 30000, "System", "The camera was moved by you (or Baritone). The mod leaves the view alone for 2 seconds.");
+            }
+            rotInit = false;
+        }
+        recaptureMouse(mc);
 
         // 1. things that own the screen or the inventory
         trackTotem(mc, cfg);
@@ -1318,6 +1339,7 @@ public final class AnchorController {
      */
     private void tickFarScan(Minecraft mc, ClientLevel level, LocalPlayer player, Config cfg) {
         if (farOrder == null) { // start a new pass
+            if (clock < nextFarPass) return;
             int rd = Mth.clamp(mc.options.renderDistance().get(), 2, 32);
             BlockPos pp = player.blockPosition();
             int pcx = pp.getX() >> 4, pcz = pp.getZ() >> 4;
@@ -1333,13 +1355,37 @@ public final class AnchorController {
         }
         int minY = level.dimensionType().minY();
         int maxY = minY + level.dimensionType().height() - 1;
-        int budget = farBudget;
+        int budget = sectionApiBroken ? Math.min(farBudget, 60_000) : 400_000;
         BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
         while (budget > 0 && farIndex < farOrder.size()) {
             int[] c = farOrder.get(farIndex++);
             if (!level.hasChunk(c[0], c[1])) continue;
             LevelChunk chunk = level.getChunk(c[0], c[1]);
-            budget -= 256 * (maxY - minY + 1);
+            Object[] sections = sectionsOf(chunk);
+            if (sections != null) {
+                // cheap: ask each 16x16x16 section whether it can contain an anchor at all
+                int minSec = minY >> 4;
+                budget -= 200 + sections.length * 10;
+                for (int si = 0; si < sections.length; si++) {
+                    if (sections[si] == null || !sectionMaybeHas(sections[si])) continue;
+                    budget -= 4096;
+                    int baseY = (minSec + si) * 16;
+                    for (int lx = 0; lx < 16; lx++) {
+                        for (int lz = 0; lz < 16; lz++) {
+                            for (int ly = 0; ly < 16; ly++) {
+                                m.set((c[0] << 4) + lx, baseY + ly, (c[1] << 4) + lz);
+                                if (chunk.getBlockState(m).is(Blocks.RESPAWN_ANCHOR)) {
+                                    BlockPos found = m.immutable();
+                                    passFound++;
+                                    if (!farFound.contains(found)) farFound.add(found);
+                                }
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+            budget -= 256 * (maxY - minY + 1); // fallback: look at every block (slow, so it is throttled hard)
             for (int lx = 0; lx < 16; lx++) {
                 for (int lz = 0; lz < 16; lz++) {
                     for (int y = minY; y <= maxY; y++) {
@@ -1373,6 +1419,29 @@ public final class AnchorController {
             }
             passFound = 0;
             farOrder = null;
+            nextFarPass = clock + (sectionApiBroken ? 40 : 100); // breathe between passes: this must stay cheap
+        }
+    }
+
+    private static Object[] sectionsOf(LevelChunk chunk) {
+        if (sectionApiBroken) return null;
+        try {
+            if (getSectionsM == null) getSectionsM = chunk.getClass().getMethod("getSections");
+            return (Object[]) getSectionsM.invoke(chunk);
+        } catch (Exception e) {
+            sectionApiBroken = true;
+            ActivityLog.warn("Anchor", "Chunk sections can't be read in this version; using the slower block-by-block scan.");
+            return null;
+        }
+    }
+
+    private static boolean sectionMaybeHas(Object section) {
+        try {
+            if (maybeHasM == null) maybeHasM = section.getClass().getMethod("maybeHas", java.util.function.Predicate.class);
+            return (Boolean) maybeHasM.invoke(section, ANCHOR_PRED);
+        } catch (Exception e) {
+            sectionApiBroken = true;
+            return true;
         }
     }
 
@@ -1872,6 +1941,7 @@ public final class AnchorController {
         rtpGraceUntil = clock + 300; // 15 s for the new chunks to load before the no-anchor timer counts
         ticksSinceScan = 1000;
         itemScanClock = 1000;
+        nextFarPass = clock;
         pendingGotoAt = clock + 200; // by then the scan has had a look; if nothing is in reach, Baritone heads out
         pendingGotoWhy = "Teleport complete. Heading for the closest anchor.";
         ActivityLog.important("RTP", "Teleport successful. Resuming anchor search.");
@@ -2632,6 +2702,7 @@ public final class AnchorController {
 
     /** Eased, slightly noisy rotation: fast when far, slow when close, with a small dead zone. */
     private void rotateTo(LocalPlayer p, float targetYaw, float targetPitch) {
+        if (clock < userLookUntil) return; // you are steering: never fight the player for the camera
         float dYaw = Mth.wrapDegrees(targetYaw - p.getYRot());
         float dPitch = targetPitch - p.getXRot();
         float dist = (float) Math.hypot(dYaw, dPitch);
@@ -2644,5 +2715,33 @@ public final class AnchorController {
 
         p.setYRot(p.getYRot() + dYaw * ratio);
         p.setXRot(Mth.clamp(p.getXRot() + dPitch * ratio, -90.0F, 90.0F));
+        expYaw = p.getYRot();
+        expPitch = p.getXRot();
+        rotInit = true;
+    }
+
+    /** If no menu is open but the mouse isn't captured (so you can't look around or place blocks), capture it again. */
+    private void recaptureMouse(Minecraft mc) {
+        if (regrabBroken || mc.player == null || mc.level == null) {
+            ungrabTicks = 0;
+            return;
+        }
+        try {
+            if (mc.gui.screen() != null || !(Boolean) mc.getClass().getMethod("isWindowActive").invoke(mc)) {
+                ungrabTicks = 0;
+                return;
+            }
+            Object mh = mc.getClass().getField("mouseHandler").get(mc);
+            boolean grabbed = (Boolean) mh.getClass().getMethod("isMouseGrabbed").invoke(mh);
+            if (grabbed) {
+                ungrabTicks = 0;
+            } else if (++ungrabTicks > 30) {
+                mh.getClass().getMethod("grabMouse").invoke(mh);
+                ungrabTicks = 0;
+                ActivityLog.warn("System", "The mouse wasn't captured although no menu was open. Captured it again.");
+            }
+        } catch (Exception e) {
+            regrabBroken = true;
+        }
     }
 }

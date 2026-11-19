@@ -111,7 +111,7 @@ public final class AnchorController {
     private int totWait;
 
     // rain trident state
-    private enum Tri { NONE, PREP, SWAP, AIM, CHARGE, LAUNCH, FLIGHT }
+    private enum Tri { NONE, PREP, SWAP, AIM, CHARGE, CANCEL, LAUNCH, FLIGHT }
     private Tri tri = Tri.NONE;
     private BlockPos triTarget;
     private Vec3 triAim;
@@ -216,6 +216,12 @@ public final class AnchorController {
     private double triLastDist = Double.MAX_VALUE;
     private BlockPos triLastTarget;
     private int triHops;
+    private boolean triTrip;                 // a multi-hop trip is in progress (no landing or re-search between hops)
+    private Vec3 triHopStart;
+    private Vec3 triHopDir;
+    private int triBlocked;
+    private int triCancelTicks;
+    private final List<double[]> blockedBins = new ArrayList<>(); // {yawBin, pitchBin, x, z} of launches that hit something
 
     private int clusterCacheTick = -100;
     private boolean clusterCache;
@@ -1451,12 +1457,6 @@ public final class AnchorController {
         return p.getLookAngle().dot(want.normalize()) > 0.99985; // within about one degree
     }
 
-    private boolean laneClear(ClientLevel level, LocalPlayer player, Vec3 eye, Vec3 aim, BlockPos anchor) {
-        BlockHitResult hit = level.clip(new ClipContext(eye, aim, ClipContext.Block.OUTLINE, ClipContext.Fluid.NONE, player));
-        if (hit.getType() == HitResult.Type.MISS) return true;
-        return resolveBreakBlock(level, player, eye, aim, anchor) != null;
-    }
-
     /** Ground (or water) within maxDrop blocks below the point, and no lava, fire or magma on the way down. */
     private boolean landingSafe(ClientLevel level, Vec3 end, int maxDrop) {
         BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
@@ -1472,51 +1472,109 @@ public final class AnchorController {
     }
 
     /**
-     * Where to point the launch: straight at the anchor if there's a clear line, otherwise along the best clear lane
-     * toward it (tilting up and sideways a little to get over or around terrain), ending somewhere safe to land.
+     * Whether a player-sized body flying from start along dir for the given length would hit anything. It checks
+     * cells at foot, waist and head height, in the middle and 0.4 to each side, every block of the way, so a lane that
+     * only looks clear for the eyes (but would clip a ledge with the feet or shoulders) is rejected.
      */
-    private Vec3 planLaunch(ClientLevel level, LocalPlayer player, BlockPos pos, Config cfg) {
-        Vec3 eye = player.getEyePosition();
-        Vec3 direct = findAimPoint(level, player, pos, Double.MAX_VALUE);
-        if (direct != null) return direct;
-        Vec3 to = Vec3.atCenterOf(pos).subtract(eye);
-        double len = to.length();
-        if (len < 1.0E-6) return null;
-        Vec3 toN = to.scale(1.0 / len);
-        double basePitch = Math.atan2(to.y, Math.hypot(to.x, to.z));
-        double baseYaw = Math.atan2(to.z, to.x);
-        double hop = cfg.tridentHop;
-        double[] pitchUp = {0, 10, 20, 30, 40};
-        double[] yawOff = {0, 15, -15, 30, -30};
-        for (double pu : pitchUp) {
-            for (double yo : yawOff) {
-                double th = Mth.clamp(basePitch + Math.toRadians(pu), -1.0, 1.2);
-                double ph = baseYaw + Math.toRadians(yo);
-                Vec3 dir = new Vec3(Math.cos(th) * Math.cos(ph), Math.sin(th), Math.cos(th) * Math.sin(ph));
-                if (dir.dot(toN) < 0.5) continue;
-                Vec3 end = eye.add(dir.scale(hop));
-                BlockHitResult hit = level.clip(new ClipContext(eye, end, ClipContext.Block.OUTLINE,
-                        ClipContext.Fluid.NONE, player));
-                if (hit.getType() != HitResult.Type.MISS) continue;
-                if (!landingSafe(level, eye.add(dir.scale(hop * 0.5)), cfg.maxDropBlocks)
-                        || !landingSafe(level, end, cfg.maxDropBlocks)) continue;
-                return end;
+    private boolean pathClear(ClientLevel level, Vec3 start, Vec3 dir, double length) {
+        int steps = (int) Math.ceil(length);
+        double[] heights = {0.2, 1.0, 1.8};
+        for (int i = 0; i <= steps; i++) {
+            double t = Math.min(length, i);
+            double x = start.x + dir.x * t, y = start.y + dir.y * t, z = start.z + dir.z * t;
+            for (double dy : heights) {
+                for (int k = 0; k < 5; k++) {
+                    double ox = k == 1 ? 0.4 : k == 2 ? -0.4 : 0.0;
+                    double oz = k == 3 ? 0.4 : k == 4 ? -0.4 : 0.0;
+                    BlockPos bp = BlockPos.containing(x + ox, y + dy, z + oz);
+                    BlockState st = level.getBlockState(bp);
+                    if (!st.getCollisionShape(level, bp).isEmpty() || hazard(st)) return false;
+                }
             }
         }
-        return null;
+        return true;
     }
 
-    /** While idle in rain: head for the closest known anchor that is out of reach, hop after hop. */
-    private void tridentIdle(Minecraft mc, LocalPlayer player, ClientLevel level, Config cfg) {
-        triHold = false;
-        if (!cfg.tridentEnabled || !level.isRaining() || clock < triFailUntil) return;
-        int slot0 = Mth.clamp(cfg.tridentSlot, 1, 9) - 1;
-        if (!player.getInventory().getItem(slot0).is(Items.TRIDENT)) return;
-        farFound.removeIf(q -> !level.getBlockState(q).is(Blocks.RESPAWN_ANCHOR));
-        if (farFound.isEmpty() || !player.isInWaterOrRain()) return; // sheltered: let Baritone walk out
+    private boolean pathClearLook(ClientLevel level, LocalPlayer player, Config cfg) {
+        return pathClear(level, player.position(), player.getLookAngle(), Math.max(8, cfg.tridentHop));
+    }
 
+    private double[] binOf(Vec3 dir) {
+        double yb = Math.floor(Math.toDegrees(Math.atan2(dir.z, dir.x)) / 20.0);
+        double pb = Math.floor(Math.toDegrees(Math.asin(Mth.clamp(dir.y, -1.0, 1.0))) / 15.0);
+        return new double[]{yb, pb};
+    }
+
+    private boolean blockedBin(Vec3 dir, Vec3 start) {
+        if (blockedBins.isEmpty()) return false;
+        double[] b = binOf(dir);
+        for (double[] e : blockedBins) {
+            if (e[0] == b[0] && e[1] == b[1] && Math.hypot(e[2] - start.x, e[3] - start.z) < 8.0) return true;
+        }
+        return false;
+    }
+
+    private void noteBlockedHop() {
+        if (triHopDir == null || triHopStart == null) return;
+        double[] b = binOf(triHopDir);
+        blockedBins.add(new double[]{b[0], b[1], triHopStart.x, triHopStart.z});
+        if (blockedBins.size() > 40) blockedBins.remove(0);
+    }
+
+    /**
+     * Picks the best launch direction from here toward an anchor. The straight line is used only if a whole
+     * body-sized lane is clear (up to just before the anchor); otherwise it searches sideways and, above all, upward
+     * (into the sky first, then down onto the target from above), scoring each clear lane by how close it ends to the
+     * anchor. Lanes that ended in a block last time are skipped, so it can't repeat the same bad launch.
+     */
+    private Vec3 planLaunch(ClientLevel level, LocalPlayer player, BlockPos pos, Config cfg) {
+        Vec3 start = player.position();
         Vec3 eye = player.getEyePosition();
-        double aim = cfg.aimDistance;
+        Vec3 center = Vec3.atCenterOf(pos);
+        Vec3 to = center.subtract(eye);
+        double dist = to.length();
+        if (dist < 1.0E-6) return null;
+        double lane = Math.max(8, cfg.tridentHop);
+        double basePitch = Math.atan2(to.y, Math.hypot(to.x, to.z));
+        double baseYaw = Math.atan2(to.z, to.x);
+        double[] pitchDeg = {Double.NaN, 0, 10, 20, 30, 40, 50, 60, 70, -10};
+        double[] yawDeg = {0, 12, -12, 25, -25, 40, -40, 60, -60, 90, -90};
+        Vec3 best = null;
+        double bestScore = Double.MAX_VALUE;
+        for (double pd : pitchDeg) {
+            boolean direct = Double.isNaN(pd);
+            double th = direct ? basePitch : Math.toRadians(pd);
+            for (double yd : yawDeg) {
+                if (direct && yd != 0) continue;
+                double ph = baseYaw + Math.toRadians(yd);
+                Vec3 dir = new Vec3(Math.cos(th) * Math.cos(ph), Math.sin(th), Math.cos(th) * Math.sin(ph));
+                if (blockedBin(dir, start)) continue;
+                double len = direct ? Math.max(2.0, Math.min(lane, dist - 1.0)) : lane;
+                if (!pathClear(level, start, dir, len)) continue;
+                Vec3 end = start.add(dir.scale(len));
+                if (!landingSafe(level, end, cfg.maxDropBlocks)) continue;
+                double score = end.distanceTo(center) + Math.abs(yd) * 0.04 + (direct ? 0.0 : 1.5);
+                if (score < bestScore) {
+                    bestScore = score;
+                    best = direct ? center : eye.add(dir.scale(lane));
+                }
+            }
+        }
+        if (best == null || bestScore > dist + 4.0) return null; // nothing clear gets us closer: don't launch
+        return best;
+    }
+
+    private static final class TriPick {
+        BlockPos pos;
+        Vec3 aim;
+        double dist;
+    }
+
+    /** The closest known anchor that is out of mining reach and has a usable launch plan, or null. */
+    private TriPick pickPlan(ClientLevel level, LocalPlayer player, Config cfg) {
+        farFound.removeIf(q -> !level.getBlockState(q).is(Blocks.RESPAWN_ANCHOR));
+        if (farFound.isEmpty()) return null;
+        Vec3 eye = player.getEyePosition();
         List<BlockPos> sorted = new ArrayList<>(farFound);
         sorted.removeIf(q -> ignoredUntil.containsKey(q));
         sorted.sort((a, b) -> Double.compare(
@@ -1524,42 +1582,53 @@ public final class AnchorController {
         int tried = 0;
         for (BlockPos pos : sorted) {
             double d = eye.distanceTo(Vec3.atCenterOf(pos));
-            if (d <= aim) continue;              // normal mining handles these
-            if (d > cfg.tridentRange) break;     // sorted by distance: everything further is out of range too
-            if (tried++ >= 4) break;
+            if (d <= cfg.aimDistance) return null;  // the closest anchor is already in mining reach: mining takes over
+            if (d > cfg.tridentRange || tried++ >= 4) return null;
             Vec3 plan = planLaunch(level, player, pos, cfg);
-            if (plan == null) continue;
-            triHold = true;
-            if (clock < triCooldownUntil || recovering || foodBreak || tot != Tot.NONE || dep != Dep.NONE
-                    || eatPending > 0 || rtp != Rtp.NONE || refill != Refill.NONE) return;
-            if (player.getHealth() < cfg.tridentMinHealth) return;
-
-            if (!pos.equals(triLastTarget)) {
-                triLastTarget = pos;
-                triHops = 0;
-                triStall = 0;
-                triLastDist = d;
-                ActivityLog.info("Trident", "Raining. Heading for the closest anchor, " + (int) d + " blocks away.");
-            } else if (d < triLastDist - 1.0) {
-                triStall = 0;
-                triLastDist = d;
-            } else if (++triStall >= 3 || triHops >= 40) {
-                ignore(pos, 1200);
-                triLastTarget = null;
-                ActivityLog.warn("Trident", "Three launches without getting closer. Skipping this anchor for a while.");
-                return;
+            if (plan != null) {
+                TriPick r = new TriPick();
+                r.pos = pos;
+                r.aim = plan;
+                r.dist = d;
+                return r;
             }
-            triHops++;
-            triTarget = pos;
-            triAim = plan;
-            tri = Tri.PREP;
-            triTicks = 0;
-            triWait = 10 + rng.nextInt(14); // a beat to decide
-            triHoldTicks = 11 + rng.nextInt(5); // riptide needs 10+ ticks of charge; people hold a little longer
-            if (baritoneActive || clock - lastCancelTick > 100) navCancel(mc, cfg, "Baritone must be off while using the trident.");
-            ActivityLog.info("Trident", "Launch " + triHops + " toward the closest anchor (" + (int) d + " blocks).");
-            return;
         }
+        return null;
+    }
+
+    /** While idle in rain: start a trip toward the closest known anchor that is out of reach. */
+    private void tridentIdle(Minecraft mc, LocalPlayer player, ClientLevel level, Config cfg) {
+        triHold = false;
+        if (!cfg.tridentEnabled || !level.isRaining() || clock < triFailUntil) return;
+        int slot0 = Mth.clamp(cfg.tridentSlot, 1, 9) - 1;
+        if (!player.getInventory().getItem(slot0).is(Items.TRIDENT)) return;
+        if (!player.isInWaterOrRain()) return; // sheltered: let Baritone walk out
+        TriPick pick = pickPlan(level, player, cfg);
+        if (pick == null) return;
+        triHold = true; // a launch is possible: don't send Baritone off in the meantime
+        if (clock < triCooldownUntil || recovering || foodBreak || tot != Tot.NONE || dep != Dep.NONE
+                || eatPending > 0 || rtp != Rtp.NONE || refill != Refill.NONE) return;
+        if (player.getHealth() < cfg.tridentMinHealth) return;
+
+        if (!pick.pos.equals(triLastTarget)) {
+            triLastTarget = pick.pos;
+            triHops = 0;
+            triStall = 0;
+            triLastDist = pick.dist;
+        }
+        Vec3 here = player.position();
+        blockedBins.removeIf(e -> Math.hypot(e[2] - here.x, e[3] - here.z) > 60.0);
+        triTrip = true;
+        triBlocked = 0;
+        triHops = 1;
+        triTarget = pick.pos;
+        triAim = pick.aim;
+        tri = Tri.PREP;
+        triTicks = 0;
+        triWait = 10 + rng.nextInt(14); // a beat to decide
+        triHoldTicks = 11 + rng.nextInt(5); // riptide needs 10+ ticks of charge; people hold a little longer
+        if (baritoneActive || clock - lastCancelTick > 100) navCancel(mc, cfg, "Baritone must be off while using the trident.");
+        ActivityLog.info("Trident", "Raining. Heading for the closest anchor, " + (int) pick.dist + " blocks away. Launch 1.");
     }
 
     private void endTrident(Minecraft mc, int cooldownTicks) {
@@ -1568,6 +1637,7 @@ public final class AnchorController {
             triUseDown = false;
         }
         tri = Tri.NONE;
+        triTrip = false;
         triCooldownUntil = clock + cooldownTicks;
     }
 
@@ -1577,8 +1647,56 @@ public final class AnchorController {
         endTrident(mc, 0);
     }
 
+    /** Stops a charge WITHOUT firing it, by switching items (letting go of a charged trident would launch it). */
+    private void cancelCharge(LocalPlayer player, Config cfg, String why) {
+        ActivityLog.info("Trident", "Cancelling this launch: " + why);
+        int other = Mth.clamp(cfg.pickaxeSlot, 1, 9) - 1;
+        if (other == Mth.clamp(cfg.tridentSlot, 1, 9) - 1) other = (other + 1) % 9;
+        player.getInventory().setSelectedSlot(other);
+        tri = Tri.CANCEL;
+        triCancelTicks = 0;
+    }
+
+    /** The flight ended: line up and launch again at once, from wherever we are (no landing, no new search). */
+    private void continueTrip(Minecraft mc, LocalPlayer player, ClientLevel level, Config cfg) {
+        if (!player.isInWaterOrRain() || player.getHealth() < cfg.tridentMinHealth || triHops >= 40 || !level.isRaining()) {
+            endTrident(mc, 25 + rng.nextInt(25));
+            ActivityLog.info("Trident", "Trip over (" + triHops + " launches).");
+            return;
+        }
+        TriPick pick = pickPlan(level, player, cfg);
+        if (pick == null) { // in mining reach now, or no clear lane: hand back to the normal logic
+            endTrident(mc, 25 + rng.nextInt(25));
+            ActivityLog.info("Trident", "Trip over (" + triHops + " launches).");
+            return;
+        }
+        if (pick.pos.equals(triLastTarget)) {
+            if (pick.dist < triLastDist - 1.0) {
+                triStall = 0;
+                triLastDist = pick.dist;
+            } else if (++triStall >= 5) {
+                ignore(pick.pos, 1200);
+                triLastTarget = null;
+                ActivityLog.warn("Trident", "Five launches without getting closer. Skipping this anchor for a while.");
+                endTrident(mc, 60);
+                return;
+            }
+        } else {
+            triLastTarget = pick.pos;
+            triStall = 0;
+            triLastDist = pick.dist;
+        }
+        triHops++;
+        triTarget = pick.pos;
+        triAim = pick.aim;
+        tri = Tri.AIM;
+        triWait = 3 + rng.nextInt(5);
+        triHoldTicks = 11 + rng.nextInt(5);
+        ActivityLog.info("Trident", "Launch " + triHops + ": " + (int) pick.dist + " blocks from the closest anchor.");
+    }
+
     private void tickTrident(Minecraft mc, LocalPlayer player, ClientLevel level, Config cfg) {
-        if (++triTicks > 500) {
+        if (++triTicks > 1500) {
             failTrident(mc, "The trident sequence timed out.");
             return;
         }
@@ -1588,6 +1706,7 @@ public final class AnchorController {
         }
         boolean anchorThere = level.getBlockState(triTarget).is(Blocks.RESPAWN_ANCHOR);
         Vec3 eye = player.getEyePosition();
+        int slot0 = Mth.clamp(cfg.tridentSlot, 1, 9) - 1;
         switch (tri) {
             case PREP -> {
                 if (!anchorThere) { endTrident(mc, 20); return; }
@@ -1601,9 +1720,11 @@ public final class AnchorController {
             case AIM -> {
                 if (!anchorThere) { endTrident(mc, 20); return; }
                 if (!player.isInWaterOrRain()) { endTrident(mc, 200); return; }
-                if (!laneClear(level, player, eye, triAim, triTarget)) {
+                if (player.getInventory().getSelectedSlot() != slot0) { tri = Tri.SWAP; return; }
+                if (!pathClear(level, player.position(), aim(eye, triAim), Math.max(8, cfg.tridentHop))
+                        && triAim.distanceTo(Vec3.atCenterOf(triTarget)) > 1.5) {
                     Vec3 np = planLaunch(level, player, triTarget, cfg);
-                    if (np == null) { endTrident(mc, 200); return; }
+                    if (np == null) { endTrident(mc, 100); return; }
                     triAim = np;
                 }
                 if (aimedAt(player, triAim)) {
@@ -1615,18 +1736,36 @@ public final class AnchorController {
                 }
             }
             case CHARGE -> {
-                if (!anchorThere || !player.isInWaterOrRain()) { endTrident(mc, 100); return; }
-                if (!aimedAt(player, triAim)) rotateToward(player, eye, triAim);
+                if (!anchorThere) { cancelCharge(player, cfg, "the anchor is gone"); return; }
+                if (!player.isInWaterOrRain()) { cancelCharge(player, cfg, "no longer in the rain"); return; }
                 mc.options.keyUse.setDown(true);
                 triUseDown = true;
                 triChargeTicks++;
-                if (player.isUsingItem() && player.getTicksUsingItem() >= triHoldTicks) {
+                boolean aimed = aimedAt(player, triAim);
+                boolean clear = pathClearLook(level, player, cfg);
+                if ((!clear || !aimed) && triChargeTicks % 3 == 0) {
+                    // the lane got blocked (we drifted) or we aren't lined up: keep holding the charge and re-plan
+                    Vec3 np = planLaunch(level, player, triTarget, cfg);
+                    if (np != null) triAim = np;
+                }
+                if (!aimed) rotateToward(player, eye, triAim);
+                if (player.isUsingItem() && player.getTicksUsingItem() >= triHoldTicks && aimed && clear) {
                     mc.options.keyUse.setDown(false); // letting go launches it
                     triUseDown = false;
+                    triHopStart = player.position();
+                    triHopDir = player.getLookAngle();
                     tri = Tri.LAUNCH;
                     triLaunchWait = 0;
+                } else if (triChargeTicks > 200) {
+                    cancelCharge(player, cfg, "no clear lane found");
                 } else if (triChargeTicks > 30 && !player.isUsingItem()) {
                     failTrident(mc, "The trident wouldn't charge.");
+                }
+            }
+            case CANCEL -> {
+                triCancelTicks++;
+                if (!player.isUsingItem() || triCancelTicks > 20) {
+                    endTrident(mc, 60);
                 }
             }
             case LAUNCH -> {
@@ -1638,12 +1777,31 @@ public final class AnchorController {
             }
             case FLIGHT -> {
                 if (!player.isAutoSpinAttack()) {
-                    endTrident(mc, 25 + rng.nextInt(25));
-                    ActivityLog.info("Trident", "Flight finished.");
+                    double moved = triHopStart == null ? 99 : player.position().distanceTo(triHopStart);
+                    ActivityLog.info("Trident", String.format(Locale.ROOT, "Flight finished (%.0f blocks).", moved));
+                    if (moved < 3.0) { // it hit something right away: remember that direction so it isn't repeated
+                        noteBlockedHop();
+                        if (++triBlocked >= 3) {
+                            ignore(triTarget, 600);
+                            ActivityLog.warn("Trident", "Three launches in a row ran into blocks. Skipping this anchor for a while.");
+                            endTrident(mc, 60);
+                            return;
+                        }
+                    } else {
+                        triBlocked = 0;
+                    }
+                    continueTrip(mc, player, level, cfg);
                 }
             }
             default -> { }
         }
+    }
+
+    /** Unit direction from the eyes to a point. */
+    private static Vec3 aim(Vec3 eye, Vec3 point) {
+        Vec3 d = point.subtract(eye);
+        double l = d.length();
+        return l < 1.0E-6 ? new Vec3(0, 0, 1) : d.scale(1.0 / l);
     }
 
     // ---------------------------------------------------------------- state and navigation arbiter

@@ -106,9 +106,14 @@ Slow checks (stall detection, flood watch) only run when nothing time-critical i
 * **Flood Avoider**: Baritone pillaring up over a wall looks like rising about a block at a time in the same column while standing on the
   ground. After *sensitivity* steps it cancels Baritone and RTPs (or just restarts the goto). Swimming, going around a wall, stairs, ladders
   and ordinary bridging don't count.
-* **Rain Trident**: in rain, with a Riptide trident in the trident slot, it launches toward the closest known anchor (anywhere in render
-  distance up to *max distance*), hop after hop, tilting around obstacles and checking the landing for lava and big drops. It stops after
-  three launches that don't get closer, and never launches on low health. Baritone is cancelled first.
+* **Rain Trident**: in rain, with a Riptide trident in the trident slot, it makes a *trip* to the closest known anchor (anywhere in render
+  distance up to *max distance*): it launches, and when the flight ends it lines up and launches again straight away, in the air, with no
+  landing or new search in between, until an anchor is in mining reach (then normal mining takes over). Each launch is planned so the
+  whole player-sized lane is clear (feet, waist, head, shoulders), not just the line of sight: if the straight line is blocked it picks the
+  best clear lane, sideways or upward (into the sky first, then down onto the target). A lane that ended in a block is remembered and not
+  repeated, a launch is cancelled (by switching items, never by firing it) if the lane gets blocked while charging, and the trip is dropped
+  after 5 launches without getting closer or 3 blocked ones in a row. It checks the landing for lava and big drops, never launches
+  on low health, and cancels Baritone first. *Lane length* is how far ahead the lane must be clear: set it a little longer than one flight.
 
 **Overlays**: toggles and positions (market: refresh time and what to show).
 

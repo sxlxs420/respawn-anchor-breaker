@@ -102,7 +102,11 @@ public final class Modules {
                 () -> c().baritoneGoto, v -> c().baritoneGoto = v)
                 .text("Goto command", "Sent in chat to start navigation.", () -> c().gotoCommand, v -> c().gotoCommand = v)
                 .text("Cancel command", "Sent in chat to stop Baritone.",
-                        () -> c().baritoneCancelCommand, v -> c().baritoneCancelCommand = v));
+                        () -> c().baritoneCancelCommand, v -> c().baritoneCancelCommand = v)
+                .toggle("Coordinate fallback", "If Baritone can't find an anchor, send the coordinates of one we've seen.",
+                        () -> c().gotoCoordFallback, v -> c().gotoCoordFallback = v)
+                .integer("Idle watchdog (s)", "Nothing happening this long: send Baritone to the closest known anchor.",
+                        () -> c().idleWatchdogSeconds, v -> c().idleWatchdogSeconds = v, 10, 300, 5));
         add(new Module("stuck_recovery", "Stuck Recovery",
                 "Restarts the goto if Baritone stops making progress.", "Navigation",
                 () -> c().stuckRecovery, v -> c().stuckRecovery = v)
@@ -141,6 +145,8 @@ public final class Modules {
                 .integer("Trident slot", "Hotbar slot (1-9).", () -> c().tridentSlot, v -> c().tridentSlot = v, 1, 9, 1)
                 .integer("Max distance", "Farthest anchor to head for (blocks).",
                         () -> c().tridentRange, v -> c().tridentRange = v, 10, 512, 10)
+                .integer("Ascent angle", "Every hop launches up at this angle (degrees) toward the anchor.",
+                        () -> c().tridentAscent, v -> c().tridentAscent = v, 15, 75, 5)
                 .integer("Lane length", "Clear lane required ahead of each launch.",
                         () -> c().tridentHop, v -> c().tridentHop = v, 6, 40, 1)
                 .integer("Min health (HP)", "Won't launch below this.",

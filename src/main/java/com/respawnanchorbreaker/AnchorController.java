@@ -239,6 +239,23 @@ public final class AnchorController {
     private boolean swimKeysDown;
     private boolean breathing;
 
+    // ---- v3: restored ("ghost") breaks, idle watchdog, coordinate gotos, water routes
+    public static volatile int knownAnchors;
+    public static volatile int nearestAnchor = -1;
+    private final Map<Long, Integer> ghostCounts = new HashMap<>();
+    private final Map<BlockPos, Integer> coordTried = new HashMap<>();
+    private BlockPos pendingBreakPos;
+    private int pendingBreakTick;
+    private int quietSince;
+    private Vec3 stillPos;
+    private int stillSince;
+    private boolean postRtp;
+    private boolean pendingGotoCoords;
+    private String triWhy = "";
+    private List<BlockPos> wPath;
+    private int wIdx;
+    private int wRepath = -1000;
+
     // pickup state
     private ItemEntity pickup;
     private int itemScanClock = 1000;
@@ -352,6 +369,12 @@ public final class AnchorController {
             beginFoodBreak(mc, player, cfg);
         }
 
+        // 4b. keep the map of known anchors fresh (cheap), notice anchors the server restored, track idleness
+        tickFarScan(mc, level, player, cfg);
+        checkPendingBreak(mc, player, level, cfg);
+        if (clock % 20 == 0) updateKnown(player);
+        if (!navIdle()) quietSince = clock;
+
         // 5. dropped anchors: collect them (but a cluster is cleared first)
         if (pickup != null && !pickupStillValid(player, cfg)) {
             endPickup(mc);
@@ -422,7 +445,7 @@ public final class AnchorController {
         // 10. anchor breaking
         if (target != null && !stillValid(player, level)) {
             if (ticksOnTarget > 0 && !level.getBlockState(target).is(Blocks.RESPAWN_ANCHOR)) {
-                onAnchorBroken(cfg);
+                onAnchorBroken(target, cfg);
             } else {
                 ActivityLog.infoEvery("target-drop", 10000, "Mining", "Anchor target dropped (out of range or no longer there).");
             }
@@ -431,7 +454,6 @@ public final class AnchorController {
         double aimMax = Math.min(cfg.aimDistance, player.blockInteractionRange() - 0.05);
 
         if (target == null) {
-            tickFarScan(mc, level, player, cfg);
             tickNavMonitor(mc, player, cfg);
             tickFloodWatch(mc, player, level, cfg);
             tickItemAssist(mc, cfg);
@@ -448,6 +470,7 @@ public final class AnchorController {
                 } else if (!waterIdle(mc, player, level, cfg)) {
                     tridentIdle(mc, player, level, cfg);
                     if (tri == Tri.NONE && !triHold) maybeSendGoto(mc, cfg, level, player);
+                    idleWatchdog(mc, player, level, cfg);
                 }
             }
             if (target == null) {
@@ -719,10 +742,11 @@ public final class AnchorController {
 
     // ---------------------------------------------------------------- eating / baritone
 
-    private void onAnchorBroken(Config cfg) {
+    private void onAnchorBroken(BlockPos pos, Config cfg) {
+        pendingBreakPos = pos.immutable(); // counted for real only if the server doesn't put it back
+        pendingBreakTick = clock;
         minedSinceGoto++;
         lastBreakTick = clock;
-        Stats.recordMined();
         restartTicks.clear();
         noAnchorSince = -1;
         profitSince = -1;
@@ -732,6 +756,38 @@ public final class AnchorController {
             eatToLevel = 0;
             eatDelay = 12; // give the drop time to appear and be picked up first
         }
+    }
+
+    /** Confirms a break after 30 ticks, or notices that the server restored the anchor (it was never really broken). */
+    private void checkPendingBreak(Minecraft mc, LocalPlayer player, ClientLevel level, Config cfg) {
+        if (pendingBreakPos == null) return;
+        if (level.getBlockState(pendingBreakPos).is(Blocks.RESPAWN_ANCHOR)) {
+            BlockPos pos = pendingBreakPos;
+            pendingBreakPos = null;
+            int n = ghostCounts.merge(pos.asLong(), 1, Integer::sum);
+            minedSinceGoto = Math.max(0, minedSinceGoto - 1);
+            ActivityLog.warn("Mining", "The server put an anchor back right after it broke (" + n
+                    + (n == 1 ? " time" : " times") + "): it was not really broken, no drop.");
+            handleGhost(mc, player, level, cfg, pos, n);
+        } else if (clock - pendingBreakTick >= 30) {
+            Stats.recordMined();
+            ghostCounts.remove(pendingBreakPos.asLong());
+            pendingBreakPos = null;
+        }
+    }
+
+    private void handleGhost(Minecraft mc, LocalPlayer player, ClientLevel level, Config cfg, BlockPos pos, int n) {
+        if (n >= 5) {
+            ignore(pos, 12000);
+            ActivityLog.warn("Mining", "The server keeps restoring this anchor (it is probably protected). Skipping it for 10 minutes.");
+            return;
+        }
+        ignore(pos, 60); // short pause, then another try with a different aim
+        if (n >= 2 && cfg.baritoneGoto) {
+            BlockPos cell = standCell(level, pos, n);
+            if (cell != null && gotoCell(mc, cfg, cell, "Mining it from a different position (attempt " + (n + 1) + ").")) return;
+        }
+        ActivityLog.info("Mining", "Trying a different angle on that anchor (attempt " + (n + 1) + ").");
     }
 
     /** Eats one piece at a time from the food slot. Returns true while eating owns this tick. */
@@ -1361,7 +1417,7 @@ public final class AnchorController {
         }
         int minY = level.dimensionType().minY();
         int maxY = minY + level.dimensionType().height() - 1;
-        int budget = sectionApiBroken ? Math.min(farBudget, 60_000) : 400_000;
+        int budget = sectionApiBroken ? (level.isRaining() && cfg.tridentEnabled ? 250_000 : 60_000) : 400_000;
         BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
         while (budget > 0 && farIndex < farOrder.size()) {
             int[] c = farOrder.get(farIndex++);
@@ -1408,6 +1464,15 @@ public final class AnchorController {
         if (farIndex >= farOrder.size()) { // pass finished
             farFound.removeIf(q -> !level.getBlockState(q).is(Blocks.RESPAWN_ANCHOR));
             farPasses++;
+            ActivityLog.infoEvery("scan-mode", 900000, "Anchor", "The anchor scan uses "
+                    + (sectionApiBroken ? "the block-by-block fallback (slower)." : "the fast chunk-section check."));
+            if (postRtp && !farFound.isEmpty()) { // anchors seen right after a teleport: go now, don't wait
+                if (pendingGotoAt < 0 || pendingGotoAt > clock + 10) {
+                    pendingGotoAt = clock + 10;
+                    pendingGotoWhy = "Anchors found after the teleport. Heading for the closest one.";
+                }
+                pendingGotoCoords = true;
+            }
             if (passFound == 0 && farFound.isEmpty()) {
                 if (noAnchorSince < 0) {
                     noAnchorSince = clock;
@@ -1425,7 +1490,7 @@ public final class AnchorController {
             }
             passFound = 0;
             farOrder = null;
-            nextFarPass = clock + (sectionApiBroken ? 40 : 100); // breathe between passes: this must stay cheap
+            nextFarPass = clock + (sectionApiBroken ? 20 : 20); // breathe between passes: this must stay cheap
         }
     }
 
@@ -1522,10 +1587,11 @@ public final class AnchorController {
     }
 
     /**
-     * Picks the best launch direction from here toward an anchor. The straight line is used only if a whole
-     * body-sized lane is clear (up to just before the anchor); otherwise it searches sideways and, above all, upward
-     * (into the sky first, then down onto the target from above), scoring each clear lane by how close it ends to the
-     * anchor. Lanes that ended in a block last time are skipped, so it can't repeat the same bad launch.
+     * Picks where to point a launch. Every launch goes UP toward the anchor (never level, never straight into the
+     * terrain): the angle is the Ascent setting, steeper when the anchor is above, and the chosen lane must be clear for
+     * a whole player-sized body. Only when already airborne and above the anchor does it come down onto it along a
+     * clear lane. If the best lane would put us too high above the ground it flattens the angle a little rather than
+     * climbing forever. Lanes that ended in a block last time are skipped.
      */
     private Vec3 planLaunch(ClientLevel level, LocalPlayer player, BlockPos pos, Config cfg) {
         Vec3 start = player.position();
@@ -1535,33 +1601,45 @@ public final class AnchorController {
         double dist = to.length();
         if (dist < 1.0E-6) return null;
         double lane = Math.max(8, cfg.tridentHop);
-        double basePitch = Math.atan2(to.y, Math.hypot(to.x, to.z));
+        double horiz = Math.hypot(to.x, to.z);
         double baseYaw = Math.atan2(to.z, to.x);
-        double[] pitchDeg = {Double.NaN, 0, 10, 20, 30, 40, 50, 60, 70, -10};
-        double[] yawDeg = {0, 12, -12, 25, -25, 40, -40, 60, -60, 90, -90};
+        boolean airborne = !player.onGround();
+
+        if (airborne && (to.y <= 1.0 || horiz <= lane)) { // final approach: come down onto it from above
+            Vec3 dir = to.scale(1.0 / dist);
+            double len = Math.max(2.0, Math.min(lane, dist - 1.0));
+            if (!blockedBin(dir, start) && pathClear(level, start, dir, len)) return center;
+        }
+
+        double basePitch = Math.atan2(to.y, horiz);
+        double asc = Math.toRadians(cfg.tridentAscent);
+        double[] pitchOff = {0, -10, 10, -20, 20, 30};
+        double[] yawDeg = {0, 10, -10, 20, -20, 35, -35, 50, -50};
         Vec3 best = null;
         double bestScore = Double.MAX_VALUE;
-        for (double pd : pitchDeg) {
-            boolean direct = Double.isNaN(pd);
-            double th = direct ? basePitch : Math.toRadians(pd);
+        for (double po : pitchOff) {
+            double th = Math.max(asc, basePitch + Math.toRadians(5)) + Math.toRadians(po);
+            th = Mth.clamp(th, Math.toRadians(15), Math.toRadians(80));
             for (double yd : yawDeg) {
-                if (direct && yd != 0) continue;
                 double ph = baseYaw + Math.toRadians(yd);
                 Vec3 dir = new Vec3(Math.cos(th) * Math.cos(ph), Math.sin(th), Math.cos(th) * Math.sin(ph));
-                if (blockedBin(dir, start)) continue;
-                double len = direct ? Math.max(2.0, Math.min(lane, dist - 1.0)) : lane;
-                if (!pathClear(level, start, dir, len)) continue;
-                Vec3 end = start.add(dir.scale(len));
+                if (blockedBin(dir, start) || !pathClear(level, start, dir, lane)) continue;
+                Vec3 end = start.add(dir.scale(lane));
                 if (!landingSafe(level, end, cfg.maxDropBlocks)) continue;
-                double score = end.distanceTo(center) + Math.abs(yd) * 0.04 + (direct ? 0.0 : 1.5);
+                double score = end.distanceTo(center) + Math.abs(yd) * 0.04 + Math.abs(po) * 0.03;
                 if (score < bestScore) {
                     bestScore = score;
-                    best = direct ? center : eye.add(dir.scale(lane));
+                    best = eye.add(dir.scale(lane));
                 }
             }
         }
-        if (best == null || bestScore > dist + 4.0) return null; // nothing clear gets us closer: don't launch
-        return best;
+        if (best != null && bestScore <= dist + 6.0) return best;
+        if (airborne) { // nothing upward fits (too high already, or boxed in): glide at it if a lane is clear
+            Vec3 dir = to.scale(1.0 / dist);
+            double len = Math.max(2.0, Math.min(lane, dist - 1.0));
+            if (!blockedBin(dir, start) && pathClear(level, start, dir, len)) return center;
+        }
+        return null;
     }
 
     private static final class TriPick {
@@ -1570,20 +1648,35 @@ public final class AnchorController {
         double dist;
     }
 
-    /** The closest known anchor that is out of mining reach and has a usable launch plan, or null. */
+    /** The closest known anchor that is out of mining reach and has a usable launch plan, or null (triWhy says why). */
     private TriPick pickPlan(ClientLevel level, LocalPlayer player, Config cfg) {
         farFound.removeIf(q -> !level.getBlockState(q).is(Blocks.RESPAWN_ANCHOR));
-        if (farFound.isEmpty()) return null;
+        if (farFound.isEmpty()) {
+            triWhy = "no anchors known in render distance";
+            return null;
+        }
         Vec3 eye = player.getEyePosition();
         List<BlockPos> sorted = new ArrayList<>(farFound);
         sorted.removeIf(q -> ignoredUntil.containsKey(q));
+        if (sorted.isEmpty()) {
+            triWhy = "every known anchor is being skipped for now";
+            return null;
+        }
         sorted.sort((a, b) -> Double.compare(
                 eye.distanceToSqr(Vec3.atCenterOf(a)), eye.distanceToSqr(Vec3.atCenterOf(b))));
         int tried = 0;
+        double nearest = eye.distanceTo(Vec3.atCenterOf(sorted.get(0)));
         for (BlockPos pos : sorted) {
             double d = eye.distanceTo(Vec3.atCenterOf(pos));
-            if (d <= cfg.aimDistance) return null;  // the closest anchor is already in mining reach: mining takes over
-            if (d > cfg.tridentRange || tried++ >= 4) return null;
+            if (d <= cfg.aimDistance) {
+                triWhy = "the closest anchor is already in mining reach";
+                return null;
+            }
+            if (d > cfg.tridentRange) {
+                triWhy = "the closest anchor is " + (int) nearest + " blocks away, beyond the max distance of " + cfg.tridentRange;
+                return null;
+            }
+            if (tried++ >= 8) break;
             Vec3 plan = planLaunch(level, player, pos, cfg);
             if (plan != null) {
                 TriPick r = new TriPick();
@@ -1593,7 +1686,12 @@ public final class AnchorController {
                 return r;
             }
         }
+        triWhy = "no clear upward lane toward the closest anchors (" + (int) nearest + " blocks away)";
         return null;
+    }
+
+    private void triDiag(String msg) {
+        ActivityLog.infoEvery("tri-diag-" + msg.hashCode(), 45000, "Trident", msg);
     }
 
     /** While idle in rain: start a trip toward the closest known anchor that is out of reach. */
@@ -1601,10 +1699,19 @@ public final class AnchorController {
         triHold = false;
         if (!cfg.tridentEnabled || !level.isRaining() || clock < triFailUntil) return;
         int slot0 = Mth.clamp(cfg.tridentSlot, 1, 9) - 1;
-        if (!player.getInventory().getItem(slot0).is(Items.TRIDENT)) return;
-        if (!player.isInWaterOrRain()) return; // sheltered: let Baritone walk out
+        if (!player.getInventory().getItem(slot0).is(Items.TRIDENT)) {
+            triDiag("It's raining, but there's no trident in hotbar slot " + (slot0 + 1) + ".");
+            return;
+        }
+        if (!player.isInWaterOrRain()) {
+            triDiag("It's raining, but you aren't standing in the rain (roof overhead?). Baritone can walk out first.");
+            return;
+        }
         TriPick pick = pickPlan(level, player, cfg);
-        if (pick == null) return;
+        if (pick == null) {
+            triDiag("Rain trident waiting: " + triWhy + ".");
+            return;
+        }
         triHold = true; // a launch is possible: don't send Baritone off in the meantime
         if (clock < triCooldownUntil || recovering || foodBreak || tot != Tot.NONE || dep != Dep.NONE
                 || eatPending > 0 || rtp != Rtp.NONE || refill != Refill.NONE) return;
@@ -1628,7 +1735,7 @@ public final class AnchorController {
         triWait = 10 + rng.nextInt(14); // a beat to decide
         triHoldTicks = 11 + rng.nextInt(5); // riptide needs 10+ ticks of charge; people hold a little longer
         if (baritoneActive || clock - lastCancelTick > 100) navCancel(mc, cfg, "Baritone must be off while using the trident.");
-        ActivityLog.info("Trident", "Raining. Heading for the closest anchor, " + (int) pick.dist + " blocks away. Launch 1.");
+        ActivityLog.info("Trident", "Raining. Heading for the closest anchor, " + (int) pick.dist + " blocks away. Launch 1 (upward).");
     }
 
     private void endTrident(Minecraft mc, int cooldownTicks) {
@@ -1906,10 +2013,15 @@ public final class AnchorController {
 
     private void tickNavEvents(Minecraft mc, LocalPlayer player, Config cfg) {
         if (navHardFail && clock - navHardFailTick > 600) navHardFail = false; // stale report
+        if (postRtp && clock > rtpGraceUntil + 3000) postRtp = false;
         if (!navIdle()) return;
         if (pendingGotoAt >= 0 && clock >= pendingGotoAt) {
             pendingGotoAt = -1;
-            navGoto(mc, cfg, pendingGotoWhy);
+            boolean sent = pendingGotoCoords && cfg.gotoCoordFallback && mc.level != null
+                    && gotoNearestKnown(mc, cfg, player, mc.level, pendingGotoWhy);
+            pendingGotoCoords = false;
+            if (!sent) navGoto(mc, cfg, pendingGotoWhy);
+            if (sent) postRtp = false;
         }
         boolean hard = navHardFail;
         boolean soft = softFails >= 3;
@@ -1920,6 +2032,9 @@ public final class AnchorController {
         ActivityLog.warn("Navigation", hard
                 ? "Baritone says there are no anchors or paths it can use. Treating this as a navigation failure."
                 : "Baritone keeps failing to path to anchors. Treating this as a navigation failure.");
+        // Our own scan may know an anchor Baritone doesn't: send its coordinates before giving up on the area.
+        if (cfg.gotoCoordFallback && mc.level != null && gotoNearestKnown(mc, cfg, player, mc.level,
+                "Baritone couldn't find an anchor itself, but our scan has seen one. Sending its coordinates.")) return;
         if (cfg.rtpEnabled && cfg.rtpOnNavFail) {
             requestRtp(mc, cfg, "Baritone navigation failure");
         } else {
@@ -1932,12 +2047,14 @@ public final class AnchorController {
     private void tickNavMonitor(Minecraft mc, LocalPlayer player, Config cfg) {
         if (clock - lastMonitorTick > 10) resetProgress(player); // we were busy: start the clock fresh
         lastMonitorTick = clock;
+        Vec3 pos = player.position();
         if (!cfg.stuckRecovery || !baritoneActive || baritoneForItem || rtp != Rtp.NONE) {
             progressTick = clock;
+            stillPos = pos;
+            stillSince = clock;
             return;
         }
         if (progressPos == null) resetProgress(player);
-        Vec3 pos = player.position();
         boolean progress = false;
         if (pos.distanceTo(progressPos) >= 3.0) { // it's actually travelling
             progress = true;
@@ -1948,11 +2065,14 @@ public final class AnchorController {
             bestNearDist = near;
             progress = true;
         }
-        if (progress) {
-            progressTick = clock;
-            return;
+        if (stillPos == null || pos.distanceTo(stillPos) > 1.5) {
+            stillPos = pos;
+            stillSince = clock;
         }
-        if (clock - progressTick < cfg.stuckSeconds * 20) return;
+        if (progress) progressTick = clock;
+        boolean stalled = clock - progressTick >= cfg.stuckSeconds * 20;
+        boolean idleStill = clock - stillSince >= Math.max(400, cfg.stuckSeconds * 7); // parked: done or given up
+        if (!stalled && !idleStill) return;
 
         while (!restartTicks.isEmpty() && clock - restartTicks.peekFirst() > 12000) restartTicks.pollFirst();
         restartTicks.addLast(clock);
@@ -1962,12 +2082,99 @@ public final class AnchorController {
             restartTicks.clear();
             requestRtp(mc, cfg, "Navigation keeps stalling");
         } else {
-            ActivityLog.warn("Navigation", "No progress detected for " + cfg.stuckSeconds + " seconds. Restarting navigation.");
+            ActivityLog.warn("Navigation", stalled
+                    ? "No progress detected for " + cfg.stuckSeconds + " seconds. Restarting navigation."
+                    : "Baritone has been standing still for " + (clock - stillSince) / 20 + " seconds. Restarting navigation.");
             navCancel(mc, cfg, "Cancelling the stalled navigation.");
             pendingGotoAt = clock + 40 + rng.nextInt(40);
             pendingGotoWhy = "Restarting navigation after a stall.";
+            pendingGotoCoords = cfg.gotoCoordFallback && !farFound.isEmpty() && idleStill;
         }
         resetProgress(player);
+        stillSince = clock;
+        stillPos = pos;
+    }
+
+    private void updateKnown(LocalPlayer player) {
+        knownAnchors = farFound.size();
+        nearestAnchor = farFound.isEmpty() ? -1 : (int) nearestKnownAnchorDist(player);
+    }
+
+    /** Standable cell next to (or on top of) an anchor, rotating through the sides with the variant number. */
+    private BlockPos standCell(ClientLevel level, BlockPos pos, int variant) {
+        BlockPos[] cands = {pos.above(), pos.north(), pos.east(), pos.south(), pos.west()};
+        for (int i = 0; i < cands.length; i++) {
+            BlockPos c = cands[(i + variant) % cands.length];
+            if (standable(level, c)) return c;
+        }
+        return null;
+    }
+
+    private boolean passable(ClientLevel level, BlockPos p) {
+        BlockState st = level.getBlockState(p);
+        return st.getCollisionShape(level, p).isEmpty() && !hazard(st);
+    }
+
+    private boolean standable(ClientLevel level, BlockPos c) {
+        if (!passable(level, c) || !passable(level, c.above())) return false;
+        if (!level.getBlockState(c).getFluidState().isEmpty()) return false;
+        BlockPos b = c.below();
+        BlockState bs = level.getBlockState(b);
+        return bs.getFluidState().isEmpty() && bs.isFaceSturdy(level, b, Direction.UP) && !hazard(bs);
+    }
+
+    private boolean gotoCell(Minecraft mc, Config cfg, BlockPos cell, String why) {
+        if (!cfg.baritoneGoto || rtp != Rtp.NONE || clock - lastGotoTick < 40) return false;
+        String prefix = cfg.gotoCommand.trim().split("\\s+")[0];
+        sendChatCommand(mc, prefix + " " + cell.getX() + " " + cell.getY() + " " + cell.getZ());
+        baritoneActive = true;
+        baritoneForItem = false;
+        lastGotoTick = clock;
+        if (mc.player != null) resetProgress(mc.player);
+        ActivityLog.info("Navigation", why);
+        return true;
+    }
+
+    /** Sends Baritone to a spot next to the closest anchor our own scan has seen (skipping ones tried recently). */
+    private boolean gotoNearestKnown(Minecraft mc, Config cfg, LocalPlayer player, ClientLevel level, String why) {
+        farFound.removeIf(q -> !level.getBlockState(q).is(Blocks.RESPAWN_ANCHOR));
+        if (farFound.isEmpty()) return false;
+        if (coordTried.size() > 100) coordTried.clear();
+        Vec3 eye = player.getEyePosition();
+        List<BlockPos> sorted = new ArrayList<>(farFound);
+        sorted.sort((a, b) -> Double.compare(
+                eye.distanceToSqr(Vec3.atCenterOf(a)), eye.distanceToSqr(Vec3.atCenterOf(b))));
+        for (BlockPos a : sorted) {
+            if (ignoredUntil.containsKey(a)) continue;
+            Integer tried = coordTried.get(a);
+            if (tried != null && clock - tried < 6000) continue;
+            BlockPos cell = standCell(level, a, 0);
+            if (cell == null) cell = a;
+            if (gotoCell(mc, cfg, cell, why + " (" + (int) eye.distanceTo(Vec3.atCenterOf(a)) + " blocks away)")) {
+                coordTried.put(a.immutable(), clock);
+                return true;
+            }
+            return false;
+        }
+        return false;
+    }
+
+    /** Nothing happening and no goto running for a while: never just stand there, go for the closest anchor. */
+    private void idleWatchdog(Minecraft mc, LocalPlayer player, ClientLevel level, Config cfg) {
+        if (!cfg.baritoneGoto || baritoneActive || triHold || !navIdle() || rtp != Rtp.NONE) return;
+        if (clock - quietSince < cfg.idleWatchdogSeconds * 20 || clock - lastGotoTick < 200) return;
+        quietSince = clock;
+        if (cfg.waterMining && player.isInWater() && clock >= landFailUntil) {
+            wat = Wat.LAND;
+            watTicks = 0;
+            wPath = null;
+            ActivityLog.info("Water", "Idle in the water. Swimming to solid ground first.");
+            return;
+        }
+        ActivityLog.warn("Navigation", "Nothing has happened for " + cfg.idleWatchdogSeconds
+                + " seconds and Baritone isn't running. Sending it after the closest anchor.");
+        if (cfg.gotoCoordFallback && gotoNearestKnown(mc, cfg, player, level, "Idle watchdog: heading for the closest known anchor.")) return;
+        navGoto(mc, cfg, "Idle watchdog: asking Baritone to find the next anchor.");
     }
 
     private void tickItemAssist(Minecraft mc, Config cfg) {
@@ -2079,11 +2286,17 @@ public final class AnchorController {
         farIndex = 0;
         farPasses = 0;
         passFound = 0;
+        nextFarPass = clock; // scan the new surroundings immediately
         noAnchorSince = -1;
         profitSince = -1;
         ignoredUntil.clear();
         ignoredItems.clear();
         assisted.clear();
+        ghostCounts.clear();
+        coordTried.clear();
+        pendingBreakPos = null;
+        wPath = null;
+        wat = Wat.NONE;
         target = null;
         aimPoint = null;
         breakBlock = null;
@@ -2091,6 +2304,7 @@ public final class AnchorController {
         baritoneActive = false;
         baritoneForItem = false;
         progressPos = null;
+        stillPos = null;
         restartTicks.clear();
         navHardFail = false;
         softFails = 0;
@@ -2099,8 +2313,10 @@ public final class AnchorController {
         rtpGraceUntil = clock + 300; // 15 s for the new chunks to load before the no-anchor timer counts
         ticksSinceScan = 1000;
         itemScanClock = 1000;
-        nextFarPass = clock;
-        pendingGotoAt = clock + 200; // by then the scan has had a look; if nothing is in reach, Baritone heads out
+        quietSince = clock;
+        postRtp = true;
+        pendingGotoCoords = true; // prefer the coordinates of an anchor our scan sees over Baritone's own (empty) cache
+        pendingGotoAt = clock + 100; // moves up as soon as the scan sees an anchor; otherwise Baritone searches by block
         pendingGotoWhy = "Teleport complete. Heading for the closest anchor.";
         ActivityLog.important("RTP", "Teleport successful. Resuming anchor search.");
     }
@@ -2516,97 +2732,156 @@ public final class AnchorController {
         return true;
     }
 
+    /** Cells a swimmer or walker can occupy: water, the air cell right above water, or walkable ground. */
+    private boolean traversable(ClientLevel level, BlockPos c) {
+        if (!passable(level, c)) return false;
+        if (!level.getBlockState(c).getFluidState().isEmpty()) return true;
+        BlockPos b = c.below();
+        BlockState below = level.getBlockState(b);
+        if (!below.getFluidState().isEmpty()) return true;
+        return below.isFaceSturdy(level, b, Direction.UP);
+    }
+
+    /** Breadth-first route from start to the nearest cell satisfying goal, through traversable cells only. */
+    private List<BlockPos> bfsPath(ClientLevel level, BlockPos start, java.util.function.Predicate<BlockPos> goal, int maxNodes) {
+        ArrayDeque<BlockPos> q = new ArrayDeque<>();
+        Map<BlockPos, BlockPos> prev = new HashMap<>();
+        q.add(start);
+        prev.put(start, start);
+        int[][] dirs = {{1, 0, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}, {0, 1, 0}, {0, -1, 0}};
+        int n = 0;
+        while (!q.isEmpty() && n++ < maxNodes) {
+            BlockPos cur = q.poll();
+            if (!cur.equals(start) && goal.test(cur)) {
+                ArrayList<BlockPos> path = new ArrayList<>();
+                BlockPos c = cur;
+                while (!c.equals(start)) {
+                    path.add(c);
+                    c = prev.get(c);
+                }
+                java.util.Collections.reverse(path);
+                return path;
+            }
+            for (int[] d : dirs) {
+                BlockPos nx = cur.offset(d[0], d[1], d[2]);
+                if (prev.containsKey(nx)) continue;
+                if (Math.abs(nx.getX() - start.getX()) > 40 || Math.abs(nx.getZ() - start.getZ()) > 40
+                        || Math.abs(nx.getY() - start.getY()) > 30) continue;
+                if (!traversable(level, nx)) continue;
+                prev.put(nx, cur);
+                q.add(nx);
+            }
+        }
+        return null;
+    }
+
+    /** Steers toward the next cell of the current route; advances along it as cells are reached. */
+    private void followPath(Minecraft mc, LocalPlayer p, ClientLevel level) {
+        while (wPath != null && wIdx < wPath.size()) {
+            BlockPos c = wPath.get(wIdx);
+            boolean wet = !level.getBlockState(c).getFluidState().isEmpty();
+            Vec3 dest = new Vec3(c.getX() + 0.5, c.getY() + (wet ? 0.3 : 0.0), c.getZ() + 0.5);
+            if (c.equals(p.blockPosition()) || p.position().distanceTo(dest) < 0.8) {
+                wIdx++;
+                continue;
+            }
+            swimTo(mc, p, dest);
+            return;
+        }
+        if (wPath != null) { // route finished: the caller re-plans or concludes
+            releaseSwimKeys(mc);
+            wPath = null;
+        }
+    }
+
     private boolean tickWater(Minecraft mc, LocalPlayer player, ClientLevel level, Config cfg) {
         watTicks++;
         if (player.isInLava()) {
             ActivityLog.warn("Water", "In lava! Leaving water mode.");
             wat = Wat.NONE;
+            wPath = null;
             releaseSwimKeys(mc);
             return false;
         }
         if (wat == Wat.SWIM) {
             if (watTarget == null || !level.getBlockState(watTarget).is(Blocks.RESPAWN_ANCHOR) || ignoredUntil.containsKey(watTarget)) {
                 wat = Wat.NONE;
+                wPath = null;
                 releaseSwimKeys(mc);
                 return false;
             }
             Vec3 c = Vec3.atCenterOf(watTarget);
             double d = player.getEyePosition().distanceTo(c);
-            if (watTicks > 1200 || watClose > 80) {
+            if (watTicks > 1800 || watClose > 80) {
                 ignore(watTarget, 1200);
                 ActivityLog.warn("Water", "Couldn't reach or hit the underwater anchor. Skipping it.");
                 wat = Wat.NONE;
+                wPath = null;
                 releaseSwimKeys(mc);
                 return false;
             }
             if (d <= Math.max(2.0, cfg.aimDistance - 0.8)) { // close enough: acquire() takes over and mines it
                 releaseSwimKeys(mc);
+                wPath = null;
                 watClose++;
                 return true;
             }
             watClose = 0;
-            swimTo(mc, player, c);
+            BlockPos goalAnchor = watTarget;
+            if (wPath == null || wIdx >= wPath.size() || clock - wRepath > 120) {
+                wPath = bfsPath(level, player.blockPosition(), q -> q.distSqr(goalAnchor) <= 6.25, 40000);
+                wIdx = 0;
+                wRepath = clock;
+                if (wPath == null) {
+                    ignore(watTarget, 1200);
+                    ActivityLog.warn("Water", "No swimmable route to the underwater anchor. Skipping it.");
+                    wat = Wat.NONE;
+                    releaseSwimKeys(mc);
+                    return false;
+                }
+                ActivityLog.infoEvery("water-path", 15000, "Water", "Found a route to the anchor (" + wPath.size() + " blocks).");
+            }
+            followPath(mc, player, level);
             return true;
         }
         if (wat == Wat.LAND) {
             if (!player.isInWater() && player.onGround()) {
                 ActivityLog.info("Water", "Back on solid ground.");
                 wat = Wat.NONE;
+                wPath = null;
                 releaseSwimKeys(mc);
                 return false;
             }
-            if (watTicks > 1200) {
-                ActivityLog.warn("Water", "Couldn't get out of the water in 60 seconds. Carrying on regardless.");
+            if (watTicks > 1800) {
+                ActivityLog.warn("Water", "Couldn't get out of the water in 90 seconds. Carrying on regardless.");
                 landFailUntil = clock + 600;
                 wat = Wat.NONE;
+                wPath = null;
                 releaseSwimKeys(mc);
                 return false;
             }
-            if (landTarget == null || clock % 100 == 0) landTarget = findLandTarget(level, player);
-            if (landTarget == null) { // nothing solid in sight: at least come up for air
-                if (watTicks > 200) {
-                    ActivityLog.warn("Water", "No solid ground found nearby. Carrying on regardless.");
-                    landFailUntil = clock + 600;
-                    wat = Wat.NONE;
-                    releaseSwimKeys(mc);
-                    return false;
+            if (wPath == null || wIdx >= wPath.size() || clock - wRepath > 120) {
+                wPath = bfsPath(level, player.blockPosition(), q -> standable(level, q), 40000);
+                wIdx = 0;
+                wRepath = clock;
+                if (wPath == null) { // no route to land from here: come up for air, and give up after a while
+                    if (watTicks > 200) {
+                        ActivityLog.warn("Water", "No route to solid ground found nearby. Carrying on regardless.");
+                        landFailUntil = clock + 600;
+                        wat = Wat.NONE;
+                        releaseSwimKeys(mc);
+                        return false;
+                    }
+                    mc.options.keyJump.setDown(true);
+                    swimKeysDown = true;
+                    return true;
                 }
-                mc.options.keyJump.setDown(true);
-                swimKeysDown = true;
-                return true;
+                ActivityLog.infoEvery("water-path", 15000, "Water", "Found a route to land (" + wPath.size() + " blocks).");
             }
-            swimTo(mc, player, landTarget);
+            followPath(mc, player, level);
             return true;
         }
         return false;
-    }
-
-    /** The nearest solid block with two free blocks above it and no liquid or hazard, within 24 blocks. */
-    private Vec3 findLandTarget(ClientLevel level, LocalPlayer player) {
-        BlockPos base = player.blockPosition();
-        BlockPos best = null;
-        double bd = Double.MAX_VALUE;
-        BlockPos.MutableBlockPos m = new BlockPos.MutableBlockPos();
-        for (int dx = -24; dx <= 24; dx++) {
-            for (int dz = -24; dz <= 24; dz++) {
-                for (int dy = -6; dy <= 12; dy++) {
-                    m.set(base.getX() + dx, base.getY() + dy, base.getZ() + dz);
-                    double d = base.distSqr(m);
-                    if (d >= bd) continue;
-                    BlockState st = level.getBlockState(m);
-                    if (!st.getFluidState().isEmpty() || hazard(st) || !st.isFaceSturdy(level, m, Direction.UP)) continue;
-                    BlockPos a1 = m.above();
-                    BlockPos a2 = a1.above();
-                    BlockState s1 = level.getBlockState(a1);
-                    BlockState s2 = level.getBlockState(a2);
-                    if (!s1.getCollisionShape(level, a1).isEmpty() || !s1.getFluidState().isEmpty() || hazard(s1)) continue;
-                    if (!s2.getCollisionShape(level, a2).isEmpty() || hazard(s2)) continue;
-                    best = m.immutable();
-                    bd = d;
-                }
-            }
-        }
-        return best == null ? null : new Vec3(best.getX() + 0.5, best.getY() + 1.0, best.getZ() + 0.5);
     }
 
     /** Swims (or wades) toward dest with the camera leading. Returns true when within about a block of it. */
@@ -2833,14 +3108,18 @@ public final class AnchorController {
     private Vec3 findAimPoint(ClientLevel level, LocalPlayer player, BlockPos pos, double maxDist) {
         Vec3 eye = player.getEyePosition();
         double x = pos.getX(), y = pos.getY(), z = pos.getZ();
+        int ghost = ghostCounts.getOrDefault(pos.asLong(), 0);
+        double j = ghost > 0 ? 0.7 : 0.4;
         double[][] candidates = {
-                {0.5 + (rng.nextDouble() - 0.5) * 0.4, 0.5 + (rng.nextDouble() - 0.5) * 0.4, 0.5 + (rng.nextDouble() - 0.5) * 0.4},
+                {0.5 + (rng.nextDouble() - 0.5) * j, 0.5 + (rng.nextDouble() - 0.5) * j, 0.5 + (rng.nextDouble() - 0.5) * j},
                 {0.5, 0.5, 0.5},
                 {0.5, 0.9, 0.5}, {0.5, 0.1, 0.5},
                 {0.9, 0.5, 0.5}, {0.1, 0.5, 0.5},
                 {0.5, 0.5, 0.9}, {0.5, 0.5, 0.1},
         };
-        for (double[] c : candidates) {
+        int off = ghost == 0 ? 0 : (ghost * 3) % candidates.length; // after a restored break, start from another face
+        for (int i = 0; i < candidates.length; i++) {
+            double[] c = candidates[(i + off) % candidates.length];
             Vec3 p = new Vec3(x + c[0], y + c[1], z + c[2]);
             if (eye.distanceTo(p) > maxDist) continue;
             if (resolveBreakBlock(level, player, eye, p, pos) != null) return p;

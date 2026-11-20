@@ -205,6 +205,10 @@ public final class Overlays {
                 .add("   1 h ", Gfx.MUTED).add(r60 == null ? "..." : String.format(Locale.US, "%.0f/h", r60), Gfx.TEXT));
         p.lines.add(new Line().add("Carrying ", Gfx.MUTED).add(Integer.toString(AnchorController.invAnchors), Gfx.TEXT)
                 .add("   Stored ", Gfx.MUTED).add(Long.toString(Stats.deposited()), Gfx.TEXT));
+        int known = AnchorController.knownAnchors;
+        int nearest = AnchorController.nearestAnchor;
+        p.lines.add(new Line().add("Seen ", Gfx.MUTED).add(Integer.toString(known), known > 0 ? Gfx.GREEN : Gfx.MUTED)
+                .add(known > 0 ? " anchors, nearest " + nearest + "m" : " anchors in render distance", Gfx.MUTED));
         p.lines.add(new Line().add("All time ", Gfx.MUTED).add(String.format(Locale.US, "%,d", Config.get().lifetimeMined), Gfx.TEXT));
         return p;
     }

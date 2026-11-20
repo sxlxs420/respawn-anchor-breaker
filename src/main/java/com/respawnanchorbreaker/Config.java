@@ -70,6 +70,10 @@ public final class Config {
     public boolean cobbleRefill = true;
     /** Hotbar slot (1-9) to refill, or 0 to pick a free one automatically. */
     public int cobbleSlot = 0;
+    /** If Baritone can't find an anchor itself, send the coordinates of one our own scan has seen. */
+    public boolean gotoCoordFallback = true;
+    /** Nothing happening and no goto running for this long: send Baritone to the closest known anchor. */
+    public int idleWatchdogSeconds = 30;
     /** Restart Baritone when it stops making progress. */
     public boolean stuckRecovery = true;
     public int stuckSeconds = 90;
@@ -121,6 +125,8 @@ public final class Config {
     public int tridentSlot = 8;
     /** Farthest anchor (blocks) it will launch toward. It looks for anchors across your whole render distance. */
     public int tridentRange = 256;
+    /** Launch angle (degrees above the horizon) of every trident hop: it always launches UP toward the anchor. */
+    public int tridentAscent = 40;
     /** Length of the clear lane it requires ahead of each launch. */
     public int tridentHop = 14;
     /** Won't launch below this many health points. */
@@ -215,6 +221,8 @@ public final class Config {
         profitFarDistance = Math.max(60, Math.min(400, profitFarDistance));
         totemTimeoutSeconds = Math.max(15, Math.min(180, totemTimeoutSeconds));
         tridentHop = Math.max(6, Math.min(40, tridentHop));
+        tridentAscent = Math.max(15, Math.min(75, tridentAscent));
+        idleWatchdogSeconds = Math.max(10, Math.min(300, idleWatchdogSeconds));
         tridentMinHealth = Math.max(4, Math.min(20, tridentMinHealth));
         marketRefreshSeconds = Math.max(30, Math.min(900, marketRefreshSeconds));
         logLines = Math.max(3, Math.min(15, logLines));

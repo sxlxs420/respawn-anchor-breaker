@@ -76,9 +76,14 @@ Slow checks (stall detection, flood watch) only run when nothing time-critical i
 * **Auto Pickup**: walks to drops; *max drop* controls how far a fall it accepts.
 * **Water Mining**: when an anchor next to water is within *water range*, it cancels Baritone, swims there itself (sprint-swim along the
   look direction, hops when stuck), mines it, collects the drops, swims to the nearest solid ground, and only then sends Baritone again.
-  It also swims up when air runs low.
+  It finds a real route through the water (breadth-first search over water, the air right above it, and walkable ground, so it goes around
+  underwater walls), follows it cell by cell, hops when stuck, and does the same to get back to land. It also swims up when air runs low.
 * **Unreachable Drops**: if it can't walk straight to a dropped anchor, it asks Baritone to path to that spot (`#goto x y z`), since Baritone can
   place and break blocks. It gives up on that drop after 60 s.
+
+* **Restored breaks**: if the server puts an anchor back right after you broke it (no real break, no drop), the break is not counted. The next try
+  uses a different face/aim point, from the 2nd time it asks Baritone to stand at a different side of the anchor, and after 5 it skips that
+  anchor for 10 minutes. Everything is logged.
 
 **Support**
 * **Food**: food slot; *eat when hungry* with a *hunger threshold* (default 10; sprinting stops at 6) and *eat until* level. When it triggers it
@@ -95,6 +100,10 @@ Slow checks (stall detection, flood watch) only run when nothing time-critical i
 
 **Navigation**
 * **Baritone Goto**: the goto and cancel commands. (Without Baritone these would be posted in server chat: turn this off.)
+* **Never idle**: if nothing has happened and no goto is running for *idle watchdog* seconds (default 30), it sends Baritone after the closest anchor
+  its own scan has seen (by coordinates), or by block if it knows none. If Baritone says it can't find an anchor but the scan has seen one, it sends
+  the coordinates (*coordinate fallback*) instead of RTPing straight away. After an RTP the first goto also uses the coordinates of an anchor the
+  scan sees, so it doesn't depend on Baritone having scanned the new area yet.
 * **Stuck Recovery**: if Baritone makes no progress (no 3-block move and no nearer anchor) for *stall time* (default 90 s) it restarts the goto.
   Real progress resets the timer. After *max restarts* in 10 minutes it escalates to an RTP instead of looping.
 * **Auto RTP**: triggers are: no anchors in render distance for *no-anchor time* (60 s), Baritone reporting no anchors/paths in chat,
@@ -107,13 +116,14 @@ Slow checks (stall detection, flood watch) only run when nothing time-critical i
   ground. After *sensitivity* steps it cancels Baritone and RTPs (or just restarts the goto). Swimming, going around a wall, stairs, ladders
   and ordinary bridging don't count.
 * **Rain Trident**: in rain, with a Riptide trident in the trident slot, it makes a *trip* to the closest known anchor (anywhere in render
-  distance up to *max distance*): it launches, and when the flight ends it lines up and launches again straight away, in the air, with no
-  landing or new search in between, until an anchor is in mining reach (then normal mining takes over). Each launch is planned so the
-  whole player-sized lane is clear (feet, waist, head, shoulders), not just the line of sight: if the straight line is blocked it picks the
-  best clear lane, sideways or upward (into the sky first, then down onto the target). A lane that ended in a block is remembered and not
-  repeated, a launch is cancelled (by switching items, never by firing it) if the lane gets blocked while charging, and the trip is dropped
-  after 5 launches without getting closer or 3 blocked ones in a row. It checks the landing for lava and big drops, never launches
-  on low health, and cancels Baritone first. *Lane length* is how far ahead the lane must be clear: set it a little longer than one flight.
+  distance up to *max distance*). **Every launch goes up** toward the anchor at the *ascent angle* (default 40 degrees, steeper if the anchor is
+  above); it never launches level into terrain. When a flight ends it lines up and launches again at once, in the air, with no landing or new
+  search, until an anchor is in mining reach and normal mining takes over. A lane must be clear for a whole player-sized body (feet, waist, head,
+  shoulders), not just the line of sight. Only while airborne and above/near the anchor does it come down onto it along a clear lane. It flattens
+  the angle instead of climbing past the safe fall height, remembers lanes that ended in a block, cancels a charge by switching items (never by
+  firing it) if the lane gets blocked, and drops an anchor after 5 launches without getting closer. If it does nothing during rain, the Activity Log
+  says why (no trident in the slot, under a roof, no anchors known, no clear lane, too far). The *Farm Stats* overlay shows how many anchors the
+  scan currently knows and the nearest one.
 
 **Overlays**: toggles and positions (market: refresh time and what to show).
 
